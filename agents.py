@@ -89,7 +89,7 @@ class Simulation:
         self.restaurants: dict[int,Restaurant] = {} # Dictionary for O(1) restaurant lookup
         self.users : dict[int,User] = {} # Dictionary for O(1) restaurant lookup
         self.drivers = []           # Placeholder for future Driver agents
-        self.orders = []            # Global order history for analytics
+        self.orders: dict[int,Order] = {}            # Global order history for analytics
         self.order_id_counter = 1
         self.route_cache = {}
         self.graph = graph
@@ -112,13 +112,13 @@ class Simulation:
         # at the same intersection to share the same path data.
         cache_key = (origin_node, destination_node)
         
-        if cache_key not in self.route_cache:
+        # Check if key is missing OR if the path (index 1) is missing
+        if cache_key not in self.route_cache or self.route_cache[cache_key][1] is None:
             try:
-                # Use the graph passed during Simulation initialization
                 distance = nx.shortest_path_length(self.graph, origin_node, destination_node, weight='length')
                 path_nodes = nx.shortest_path(self.graph, origin_node, destination_node, weight='length')
                 self.route_cache[cache_key] = (distance, path_nodes)
-            except nx.NetworkXNoPath:
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
                 return None, None
                 
         return self.route_cache[cache_key]
@@ -131,14 +131,13 @@ class Simulation:
         """
         user = self.users.get(user_id)
         res = self.restaurants.get(restaurant_id)
-        
         if not user or not res:
             return False
 
         # If the restaurant has kitchen capacity, we fulfill the order
         if res.can_accept_order():
             # Get path data (from cache if possible) to attach to the order
-            distance, path = self.get_route_data(user.location, res.location)
+            distance, path = self.get_route_data(res.location,user.location)
             
             if distance is None:
                 return False # Safety check if nodes aren't connected
@@ -152,8 +151,9 @@ class Simulation:
                 start_time=self.current_time,
                 route_to_user=path 
             )
-            
-            self.orders.append(new_order)
+            # Add order to simulation object 
+            self.orders[self.order_id_counter] =new_order
+            # Add order to restaurant 
             res.accept_order(new_order)
             self.order_id_counter += 1
             return True
@@ -179,6 +179,28 @@ class Simulation:
             
         self.dispatch_logic()
 
+    def get_nearby_restaurants(self, user_id, max_dist=2500):
+        user = self.users.get(user_id)
+        if not user or not self.graph:
+            return []
+
+        # This finds distances from User -> All reachable nodes
+        reachable_nodes = nx.single_source_dijkstra_path_length(
+            self.graph, 
+            user.location, 
+            cutoff=max_dist, 
+            weight='length'
+        )
+
+        available_restaurants = []
+        for res_id, res in self.restaurants.items():
+            if res.location in reachable_nodes:
+                # DO NOT set the path to None in the route_cache here.
+                # If you do, the next call will return None instead of calculating the path.
+                available_restaurants.append(res_id)
+        
+        return available_restaurants
+
     def run_until(self, end_time):
         """Executes simulation ticks until reaching the specified end time"""
         while self.current_time < end_time:
@@ -186,5 +208,5 @@ class Simulation:
 
     def get_preparing_orders(self):
         """Returns IDs of orders currently in the PREPARING state"""
-        return [o.id for o in self.orders if o.status == "PREPARING"]
+        return [o.id for o in self.orders.values() if o.status == "PREPARING"]
 

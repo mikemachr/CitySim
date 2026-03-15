@@ -1,9 +1,5 @@
 import random
-import osmnx as ox 
 import networkx as nx
-import geopandas as gpd
-import pandas as pd
-from copy import deepcopy
 
 class Order:
     """Links restaurants, users and drivers"""
@@ -106,18 +102,19 @@ class Simulation:
 
     def get_route_data(self, origin_node, destination_node):
         """
-        Retrieves path data. If nodes are the same, distance is 0.
-        Uses a node-pair key to maximize cache hits across different users.
+        Retrieves routing data. If it's the first time these nodes are connected,
+        it calculates the path and caches it.
         """
         if origin_node == destination_node:
             return 0, [origin_node]
             
+        # We use a tuple of nodes as the key. This allows different users 
+        # at the same intersection to share the same path data.
         cache_key = (origin_node, destination_node)
         
         if cache_key not in self.route_cache:
-            # Only compute heavy routing if not in cache
             try:
-                # Using shortest_path_length for distance and shortest_path for nodes
+                # Use the graph passed during Simulation initialization
                 distance = nx.shortest_path_length(self.graph, origin_node, destination_node, weight='length')
                 path_nodes = nx.shortest_path(self.graph, origin_node, destination_node, weight='length')
                 self.route_cache[cache_key] = (distance, path_nodes)
@@ -128,16 +125,24 @@ class Simulation:
 
     
     def process_user_request(self, user_id: int, restaurant_id: int) -> bool:
-        """Process a user request. Gets user id """
-        res = self.restaurants.get(restaurant_id)
-        if not res:
-            return False
+        """
+        Finalizes an order. Assumes visibility/distance has already 
+        been verified by the 'Discovery' layer.
+        """
         user = self.users.get(user_id)
-        # 1. Broad Phase: Fast Euclidean distance check (Optimization)
-        # 2. Narrow Phase: Get real graph distance from cache/compute
-        distance, path = self.get_route_data(user.location, res.location)
+        res = self.restaurants.get(restaurant_id)
         
-        if distance is not None and res.can_accept_order():
+        if not user or not res:
+            return False
+
+        # If the restaurant has kitchen capacity, we fulfill the order
+        if res.can_accept_order():
+            # Get path data (from cache if possible) to attach to the order
+            distance, path = self.get_route_data(user.location, res.location)
+            
+            if distance is None:
+                return False # Safety check if nodes aren't connected
+
             p_time = res.generate_prep_time()
             new_order = Order(
                 order_id=self.order_id_counter,
@@ -145,15 +150,14 @@ class Simulation:
                 restaurant_id=restaurant_id,
                 prep_time=p_time,
                 start_time=self.current_time,
-                route_to_user= path
+                route_to_user=path 
             )
-
-
             
             self.orders.append(new_order)
             res.accept_order(new_order)
             self.order_id_counter += 1
             return True
+            
         return False
 
     def dispatch_logic(self):

@@ -2,48 +2,231 @@
 
 ## Reloj (Simulation)
 
-Todo se simula en tiempo real mediante un sistema de **ticks** (pasos de tiempo discretos). El sistema es completamente dinámico: si evolucionas un tick, el reloj global (`current_time`) avanza una cantidad fija de segundos (`step_size`). En cada paso, pasa un segundo/minuto en la calle para los conductores, en el restaurante para los pedidos y para los usuarios. Este objeto actúa como el orquestador central (Simulation) que sincroniza a todos los agentes.
+El sistema funciona como un orquestador central que gestiona la progresión del tiempo mediante **ticks discretos** (`run_tick`). La clase `Simulation` mantiene una visión global de todos los agentes y coordina la evolución del sistema.
+
+### Características principales
+
+#### Infraestructura urbana
+
+El sistema utiliza un grafo vial (`graph`) obtenido de OpenStreetMap.  
+Las rutas se calculan utilizando `networkx.shortest_path` con peso `length`, lo que permite trabajar con distancias reales.
+
+#### Registros globales
+
+La simulación mantiene diccionarios indexados por ID para acceso O(1):
+
+```
+restaurants: dict[int, Restaurant]
+users: dict[int, User]
+drivers: dict[int, Driver]
+orders: dict[int, Order]
+```
+
+#### Route Cache
+
+Para evitar recalcular rutas repetidamente, el sistema mantiene un cache:
+
+```
+route_cache[(origin_node, destination_node)] -> (distance, path)
+```
+
+Cuando una ruta se calcula por primera vez, su distancia y lista de nodos se almacenan. Las futuras consultas reutilizan esa información.
+
+#### Motor de simulación
+
+Cada `run_tick` ejecuta únicamente la **evolución del estado del sistema**:
+
+1. **Actualización de restaurantes**
+
+Los restaurantes verifican si sus órdenes han terminado de prepararse:
+
+```
+PREPARING → READY
+```
+
+cuando
+
+```
+current_time >= ready_time
+```
+
+2. **Actualización de conductores**
+
+Cada conductor ejecuta `update_position`, avanzando sobre el grafo mediante interpolación continua a lo largo de las aristas.
+
+La asignación logística **no ocurre dentro del tick**, sino mediante eventos del sistema.
+
+---
 
 ## Restaurantes
 
-Es responsable de completar pedidos de los usuarios. Se trata de un punto fijo en el mapa con: capacidad finita, pedidos que se tardan un tiempo determinado en ser completados y popularidad dinámica. Una instancia de restaurante interactúa con muchas instancias de conductores.
+Los restaurantes representan nodos fijos del grafo responsables de producir pedidos.
 
-Atributos:
-* **Ubicación:** Coordenadas (x, y) para ruteo real.
-* **Rating:** (float, dinámico) Afecta la demanda.
-* **Avg Prep Time:** Parámetro para la distribución de tiempos de cocina.
-* **Capacidad:** Límite máximo de pedidos simultáneos que la cocina puede procesar (`capacity`). Si la lista de `active_orders` iguala a la capacidad, el restaurante rechaza pedidos.
-* **Enabled:** Estado lógico que determina si el restaurante está abierto o aceptando órdenes.
-**Radio de servicio** Necesario para derterminar si un usuario es capaz de seleccionar un restaurante o no basado en sus ubicaciones relativas. 
+### Atributos
 
-Dinámica de preparación:
-Los pedidos tienen un tiempo de preparación finito generado estocásticamente (distribución exponencial). Un pedido $p_i$ pasa de estado `PREPARING` a `READY` cuando la diferencia entre el tiempo actual y el de aceptación es mayor al tiempo de preparación calculado. La capacidad solo se libera cuando un conductor recoge el pedido (`PICKED_UP`), no cuando se termina de cocinar.
+- `location`: nodo del grafo
+- `capacity`: número máximo de órdenes simultáneas
+- `avg_prep_time`: tiempo promedio de preparación
+- `service_radius`: radio máximo de entrega
+- `active_orders`: órdenes actualmente en cocina
+- `enabled`: estado operativo
 
-## Ordenes
+### Control de capacidad
 
-La unidad más atómica del sistema. La genera un usuario, se envía a un restaurante, se asigna a un conductor y se cierra solo cuando fue entregada.
+Cuando una orden es aceptada:
 
-Atributos:
-* **ID:** Identificador único generado por el contador global de la simulación.
-* **Referencias:** Mantiene vínculos al Restaurante, Usuario y Conductor.
-* **Timestamps:** Registra el `start_time`, `prep_time` y `ready_time`.
-* **Estados:**
-    * `PREPARING`: En cocina.
-    * `READY`: Listo en mostrador, esperando conductor.
-    * `PICKED_UP`: En tránsito con el repartidor.
-    * `DELIVERED`: Entregado satisfactoriamente.
+```
+accept_order(order)
+```
+
+se agrega a `active_orders`.
+
+La capacidad se libera únicamente cuando el conductor recoge el pedido:
+
+```
+remove_order(order)
+```
+
+El método `_sync_enabled_status` funciona como un **circuit breaker automático**, deshabilitando el restaurante cuando se alcanza su capacidad máxima.
+
+### Generación de tiempos de preparación
+
+Los tiempos de preparación siguen una distribución exponencial:
+
+```
+prep_time ~ Exp(1 / avg_prep_time)
+```
+
+Durante cada tick, las órdenes cuyo tiempo de preparación ha finalizado pasan a estado `READY`.
+
+---
+
+## Órdenes
+
+Las órdenes conectan usuarios, restaurantes y conductores.
+
+### Atributos
+
+- `user_id`
+- `restaurant_id`
+- `driver_id`
+- `prep_time`
+- `start_time`
+- `ready_time`
+- `route_to_user`
+
+La ruta `route_to_user` se calcula al momento de crear la orden y contiene la secuencia de nodos desde el restaurante hasta el usuario.
+
+### Ciclo de vida
+
+Las órdenes pasan por los siguientes estados:
+
+```
+PREPARING
+READY
+PICKED_UP
+DELIVERED
+```
+
+Las órdenes pueden ser asignadas a un conductor incluso si todavía están en estado `PREPARING`.
+
+---
 
 ## Conductores
 
-Agentes móviles que buscan maximizar sus ganancias. Son entidades autónomas que deciden si aceptan o no un pedido basándose en su propia lógica de negocio.
+Los conductores son agentes móviles que navegan sobre el grafo.
 
-Atributos:
-* **Ubicación Dinámica:** Cambia tick a tick según la velocidad y el grafo de ruteo real.
-* **Función de Utilidad:** Cálculo de ganancia neta (Pago - Costos de traslado - Tiempo de espera).
-* **Máquina de Estados:**
-    * `IDLE`: Disponible para recibir ofertas.
-    * `PICKING_UP`: Viajando hacia el restaurante para recolectar un pedido `READY`.
-    * `DELIVERING`: Viajando hacia la ubicación del usuario con el pedido en mano.
+Cada conductor mantiene una cola FIFO de órdenes:
 
-## Usuarios 
-Crean ordenes. Para que una orden pueda ser creada, el 
+```
+order_queue: deque[Order]
+```
+
+### Estados operativos
+
+```
+IDLE
+PICKING_UP
+DELIVERING
+```
+
+### Movimiento
+
+El movimiento se realiza sobre las aristas del grafo utilizando interpolación continua basada en la longitud real de cada arista.
+
+Variables internas relevantes:
+
+```
+current_route
+current_edge
+distance_on_edge
+coords
+```
+
+### Flujo operativo
+
+1. Cuando un conductor recibe una orden, esta se agrega a `order_queue`.
+
+2. Si el conductor está libre (`IDLE`), comienza inmediatamente a desplazarse hacia el restaurante (`PICKING_UP`).
+
+3. Si llega al restaurante antes de que el pedido esté listo, espera en el nodo del restaurante.
+
+4. Cuando el pedido está listo (`READY`), el conductor lo recoge (`PICKED_UP`) y comienza la entrega.
+
+5. Al llegar al usuario, la orden pasa a `DELIVERED` y el conductor procesa la siguiente orden en su cola.
+
+Cuando un conductor termina todas sus órdenes, vuelve al estado `IDLE`.
+
+---
+
+## Lógica de despacho (Event-Driven Dispatch)
+
+El sistema utiliza un **despachador basado en eventos**, evitando escanear todas las órdenes y conductores en cada tick.
+
+La simulación mantiene dos estructuras principales:
+
+```
+pending_orders : deque[int]
+idle_drivers   : set[int]
+```
+
+### Flujo de despacho
+
+**Cuando ocurre uno de estos eventos:**
+
+- Se crea una nueva orden
+- Un conductor termina su última entrega
+
+el sistema ejecuta el despachador.
+
+### Algoritmo de asignación
+
+El despachador asigna órdenes mientras existan:
+
+- órdenes pendientes
+- conductores disponibles
+
+```
+while pending_orders and idle_drivers:
+    order ← pending_orders.pop()
+    driver ← idle_drivers.pop()
+    asignar driver a order
+```
+
+### Ventajas
+
+Este enfoque evita escanear todo el sistema en cada tick.
+
+Complejidad aproximada:
+
+```
+O(número_de_asignaciones)
+```
+
+en lugar de
+
+```
+O(número_de_ordenes + número_de_conductores) por tick
+```
+
+Esto mejora significativamente la escalabilidad de la simulación cuando el número de agentes crece.

@@ -1,5 +1,7 @@
 import random
 import networkx as nx
+from shapely.geometry import LineString
+from collections import deque
 
 class Order:
     """Links restaurants, users and drivers"""
@@ -82,23 +84,173 @@ class User:
         self.user_id = user_id
         self.location = location
 
+class Driver:
+    """
+    Mobile agent that manages a queue of orders and moves continuously 
+    along the graph edges using distance-based interpolation.
+    """
+    def __init__(self, driver_id: int, location_node: int, speed: float = 12.0):
+        self.id = driver_id
+        self.location = location_node
+        self.speed = speed
+        self.coords = (0.0, 0.0)
+        
+        # Movement state
+        self.current_route = []
+        self.distance_on_edge = 0.0
+        self.current_edge = None
+        
+        # Logistics state
+        self.order_queue = deque() 
+        self.active_order = None
+        self.status = 'IDLE' # 'IDLE', 'PICKING_UP', 'DELIVERING'
+
+    def add_order(self, order, simulation):
+        """Adds an order to the FIFO queue and triggers movement if IDLE."""
+        self.order_queue.append(order)
+        if self.status == 'IDLE':
+            self._start_next_task(simulation)
+
+    def _start_next_task(self, simulation):
+        """Determines the next path: either to a restaurant or to a user."""
+        if not self.order_queue:
+            self.status = 'IDLE'
+            self.active_order = None
+            simulation.idle_drivers.add(self.id)
+            simulation.dispatch_logic()
+            return
+
+        self.active_order = self.order_queue[0]
+        
+        if self.status in ['IDLE', 'DELIVERING']:
+            # Phase 1: Go to Restaurant
+            self.status = 'PICKING_UP'
+            res = simulation.restaurants[self.active_order.restaurant_id]
+            # Calculate dynamic connection path from current location to Restaurant
+            _, pickup_path = simulation.get_route_data(self.location, res.location)
+            self.set_route(pickup_path)
+            
+        elif self.status == 'PICKING_UP':
+            # Phase 2: Go to User
+            self.status = 'DELIVERING'
+            # Use the static route already stored in the order
+            self.set_route(self.active_order.route_to_user)
+
+    def set_route(self, route_nodes):
+        """Initializes a route and prepares edge variables."""
+        if not route_nodes or len(route_nodes) < 2:
+            self.current_route = []
+            self.current_edge = None
+            return
+        self.current_route = list(route_nodes)
+        self.current_edge = (self.current_route[0], self.current_route[1])
+        self.distance_on_edge = 0.0
+
+    def update_position(self, step_size, simulation):
+        """
+        Movement engine with optimized route transition and safety checks.
+        """
+        # 1. Early exit if no route exists
+        if not self.current_route or len(self.current_route) < 2:
+            if self.status == 'PICKING_UP' and self.active_order and self.active_order.status == 'READY':
+                self._handle_arrival(simulation)
+            return
+
+        # 2. Advance total distance for this tick
+        self.distance_on_edge += self.speed * step_size
+        
+        # 3. Process node transitions
+        # We use a while loop to handle cases where step_size covers multiple edges
+        while len(self.current_route) >= 2:
+            u, v = self.current_edge
+            edge_data = simulation.graph.get_edge_data(u, v)[0]
+            edge_len = edge_data['length']
+
+            # If we haven't finished the current edge, stop transitioning
+            if self.distance_on_edge < edge_len:
+                break
+            
+            # If we finished the edge, subtract its length and move to the next node
+            self.distance_on_edge -= edge_len
+            self.current_route.pop(0)
+            
+            # Check if we just reached the end of the entire route
+            if len(self.current_route) < 2:
+                self.location = v
+                self._handle_arrival(simulation)
+                return
+
+            # Set up the next edge for the next iteration of the while loop
+            self.current_edge = (self.current_route[0], self.current_route[1])
+
+        # 4. Update the visual coordinates based on final position in this tick
+        self._update_coords(simulation.graph)
+
+    def _handle_arrival(self, simulation):
+        """State transition logic upon reaching a destination."""
+        if self.status == 'PICKING_UP':
+            if self.active_order.status == 'READY':
+                # Remove order from restaurant kitchen capacity
+                res = simulation.restaurants[self.active_order.restaurant_id]
+                res.remove_order(self.active_order)
+                
+                self.active_order.status = 'PICKED_UP'
+                self._start_next_task(simulation)
+            else:
+                # Wait at restaurant node until status changes to READY
+                pass
+        
+        elif self.status == 'DELIVERING':
+            self.active_order.status = 'DELIVERED'
+            self.order_queue.popleft()
+            self._start_next_task(simulation)
+
+
+    def _update_coords(self, graph):
+            """Updates coordinates using normalized interpolation to bridge meters and degrees."""
+            if not self.current_edge:
+                return
+                
+            u, v = self.current_edge
+            edge_data = graph.get_edge_data(u, v)[0]
+            edge_len = edge_data['length'] # Meters
+            
+            line = edge_data.get('geometry', LineString([
+                (graph.nodes[u]['x'], graph.nodes[u]['y']), 
+                (graph.nodes[v]['x'], graph.nodes[v]['y'])
+            ]))
+            
+            # Calculate progress as a fraction (0.0 to 1.0)
+            # This prevents 'teleportation' by ignoring raw coordinate units
+            if edge_len > 0:
+                fraction = self.distance_on_edge / edge_len
+                # Use normalized=True to treat the line length as 1.0
+                point = line.interpolate(min(fraction, 1.0), normalized=True)
+                self.coords = (point.y, point.x) # (lat, lon)
+
 class Simulation:
     def __init__(self,graph, step_size=1):
         self.current_time = 0       # Total seconds elapsed
         self.step_size = step_size  # Duration of each tick
         self.restaurants: dict[int,Restaurant] = {} # Dictionary for O(1) restaurant lookup
         self.users : dict[int,User] = {} # Dictionary for O(1) restaurant lookup
-        self.drivers = []           # Placeholder for future Driver agents
+        self.drivers: dict[int, Driver] = {} # Dict for O(1) lookup
         self.orders: dict[int,Order] = {}            # Global order history for analytics
         self.order_id_counter = 1
         self.route_cache = {}
         self.graph = graph
+        self.pending_orders: deque[int] = deque()
+        self.idle_drivers: set[int] = set()
 
     def add_restaurant(self, restaurant: Restaurant):
         self.restaurants[restaurant.id] = restaurant
 
     def add_user(self,user: User):
         self.users[user.user_id] = user
+
+    def add_driver(self, driver: Driver):
+            self.drivers[driver.id] = driver
+            self.idle_drivers.add(driver.id)
 
     def get_route_data(self, origin_node, destination_node):
         """
@@ -155,14 +307,36 @@ class Simulation:
             self.orders[self.order_id_counter] =new_order
             # Add order to restaurant 
             res.accept_order(new_order)
+            self.pending_orders.append(new_order.id)
             self.order_id_counter += 1
+            self.dispatch_logic()
             return True
             
         return False
 
     def dispatch_logic(self):
-        """Placeholder for future matching and routing algorithms"""
-        pass
+        """
+        Event-driven dispatcher.
+
+        Assigns orders to idle drivers without scanning the whole
+        system every tick. Dispatch happens only when either
+        a new order appears or a driver becomes available.
+        """
+
+        while self.pending_orders and self.idle_drivers:
+
+            order_id = self.pending_orders.popleft()
+            order = self.orders[order_id]
+
+            # Safety check (order might have been cancelled in future versions)
+            if order.driver_id is not None:
+                continue
+
+            driver_id = self.idle_drivers.pop()
+            driver = self.drivers[driver_id]
+
+            order.driver_id = driver_id
+            driver.add_order(order, self)
 
     def run_tick(self):
         """Advances the simulation by one time step"""
@@ -173,11 +347,9 @@ class Simulation:
             res.update_preparing_orders_to_ready(self.current_time)
         
         # Update Driver states (movement and delivery logic)
-        for driver in self.drivers:
-            # driver.update_position(self.current_time, self.step_size)
-            pass
+        for driver in self.drivers.values():
+            driver.update_position(self.step_size, self)
             
-        self.dispatch_logic()
 
     def get_nearby_restaurants(self, user_id, max_dist=2500):
         user = self.users.get(user_id)
@@ -206,7 +378,9 @@ class Simulation:
         while self.current_time < end_time:
             self.run_tick()
 
-    def get_preparing_orders(self):
-        """Returns IDs of orders currently in the PREPARING state"""
-        return [o.id for o in self.orders.values() if o.status == "PREPARING"]
-
+    def get_orders_by_status(self,status: str|list):
+        """Returns IDs of orders currently in the requested state"""
+        if type(status)==str:
+            status = [status]
+        return [o.id for o in self.orders.values() if o.status in status]
+    

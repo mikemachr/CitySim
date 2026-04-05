@@ -121,14 +121,17 @@ class Driver:
             self.speed = speed
 
     def generate_pickup_service_time(self):
-        """Pickup delay (seconds)"""
-        mean = 90
-        return random.expovariate(1.0 / mean)
+        mean = 75
+        sigma = 0.45
+        mu = np.log(mean) - (sigma**2)/2
+        return random.lognormvariate(mu, sigma)
 
     def generate_dropoff_service_time(self):
-        """Dropoff delay (seconds)"""
-        mean = 120
-        return random.expovariate(1.0 / mean)
+        mean = 130
+        sigma = 0.55
+        mu = np.log(mean) - (sigma**2)/2
+        return random.lognormvariate(mu, sigma)
+
     def add_order(self, order, simulation):
         """Adds an order to the FIFO queue and triggers movement if IDLE."""
         self.order_queue.append(order)
@@ -538,3 +541,26 @@ class Simulation:
             status = [status]
         return [o.id for o in self.orders.values() if o.status in status]
     
+def generate_orders(sim, rate_per_minute):
+    """
+    Generate new orders using a Poisson arrival process.
+    """
+
+    lam = rate_per_minute / 60
+    expected = lam * sim.step_size
+    arrivals = np.random.poisson(expected)
+
+    user_ids = list(sim.users.keys())
+
+    for _ in range(arrivals):
+
+        user_id = random.choice(user_ids)
+
+        nearby = sim.get_nearby_restaurants(user_id)
+
+        if not nearby:
+            continue
+
+        restaurant_id = random.choice(nearby)
+
+        sim.process_user_request(user_id, restaurant_id)

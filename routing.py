@@ -36,7 +36,22 @@ def distrito_tec():
     
 
     graph_area = ox.graph_to_gdfs(sub_graph_connected, nodes=True, edges=False).unary_union.convex_hull
-    restaurants = ox.features_from_polygon(graph_area, tags={'amenity': 'restaurant'})
+    tags = {
+        "amenity": [
+            "restaurant",
+            "fast_food",
+            "cafe",
+            "food_court",
+            "bar",
+            "pub"
+        ],
+        "shop": [
+            "bakery",
+            "confectionery"
+        ]
+    }
+
+    restaurants = ox.features_from_polygon(graph_area, tags=tags)
 
     # 3. Filter: Only keep restaurants that are close to a valid road node
     def is_routable(geom):

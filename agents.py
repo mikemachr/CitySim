@@ -153,6 +153,7 @@ class Driver:
         self.status            = 'IDLE'
         self.service_remaining: float       = 0.0
         self.service_type:     str | None   = None
+        self.available: bool = True  # set to False to take driver offline after current queue drains
 
         if speed is None:
             self.speed = max(4.5, random.gauss(6.9, 1.0))

@@ -8,7 +8,7 @@ from agents import Driver, DriverEvent, Order, Restaurant, User
 from policies.base import DispatchPolicy, RepositioningPolicy
 from policies.dispatch import HungarianPolicy
 from policies.repositioning import StaticPolicy
-
+from typing import Any
 
 class Simulation:
     """
@@ -47,7 +47,7 @@ class Simulation:
         self.idle_drivers:   set[int]   = set()
 
         self._active_user_ids: set[int] = set() # For guarding against same user placing more than one order at the time
-
+        self._schedule: list[tuple[float, str, Any]] = []  # (trigger_time, event_type, payload)
     # ------------------------------------------------------------------
     # Entity registration
     # ------------------------------------------------------------------
@@ -98,7 +98,7 @@ class Simulation:
 
     def run_tick(self):
         self.current_time += self.step_size
-
+        self._process_schedule() # scheduler update 
         # 1. Restaurants: advance cooking
         for res in self.restaurants.values():
             res.update_preparing_orders_to_ready(self.current_time)
@@ -121,6 +121,55 @@ class Simulation:
             self.run_tick()
 
     # ------------------------------------------------------------------
+    # Event scheduler 
+    # ------------------------------------------------------------------
+
+    def schedule_event(self, trigger_time: float, event_type: str, payload=None):
+        """Schedules a future simulation event.
+
+        Args:
+            trigger_time: Simulated time in seconds at which to fire the event.
+            event_type: One of 'disable_driver', 'enable_driver', 'add_driver'.
+            payload: driver_id (int) for disable/enable, Driver instance for add_driver.
+        """
+        self._schedule.append((trigger_time, event_type, payload))
+        self._schedule.sort(key=lambda x: x[0])
+
+
+    # ------------------------------------------------------------------
+    # Event schedule-handler 
+    # ------------------------------------------------------------------
+
+    def _process_schedule(self):
+        """Fires all scheduled events whose trigger time has been reached.
+
+        Mutates self._schedule in place, consuming fired events.
+        """
+        due = [(t, e, p) for t, e, p in self._schedule if t <= self.current_time]
+        self._schedule = [(t, e, p) for t, e, p in self._schedule if t > self.current_time]
+
+        for _, event_type, payload in due:
+
+            if event_type == 'disable_driver':
+                driver = self.drivers.get(payload)
+                if driver:
+                    driver.available = False
+                    # If already idle with nothing queued, remove immediately.
+                    # If busy, WENT_IDLE handler will see available=False and not re-add.
+                    if driver.status == 'IDLE' and not driver.order_queue:
+                        self.idle_drivers.discard(payload)
+
+            elif event_type == 'enable_driver':
+                driver = self.drivers.get(payload)
+                if driver:
+                    driver.available = True
+                    if driver.status == 'IDLE':
+                        self.idle_drivers.add(payload)
+
+            elif event_type == 'add_driver':
+                self.add_driver(payload)
+
+    # ------------------------------------------------------------------
     # Event handler — only place timestamps and side-effects are applied
     # ------------------------------------------------------------------
 
@@ -135,7 +184,9 @@ class Simulation:
                 self._active_user_ids.discard(order.user_id)
 
             elif event == DriverEvent.WENT_IDLE:
-                self.idle_drivers.add(driver.id)
+                if driver.available:
+                    self.idle_drivers.add(driver.id)
+            # if not available, driver goes offline silently — queue already drained
 
     # ------------------------------------------------------------------
     # Dispatch — fully delegated to policy
@@ -225,7 +276,8 @@ class Simulation:
         n_by_status = {s: 0 for s in ('PREPARING', 'READY', 'PICKED_UP', 'DELIVERED')}
         for o in self.orders.values():
             n_by_status[o.status] = n_by_status.get(o.status, 0) + 1
-
+        deactivated_drivers = sum(1 for driver in self.drivers if self.drivers[driver].available==False)
+        active_drivers = sum(1 for driver in self.drivers if self.drivers[driver].available==True)
         return {
             'time':                self.current_time,
             'dispatch_policy':     self.dispatch_policy.__class__.__name__,
@@ -233,6 +285,8 @@ class Simulation:
             'total_orders':        len(self.orders),
             'orders_by_status':    n_by_status,
             'idle_drivers':        len(self.idle_drivers),
+            "deactivated_drivers": deactivated_drivers,
+            "active_drivers": active_drivers,
             'pending_unassigned':  len(self._pending_set),
             'avg_end_to_end_s':    safe_mean(o.end_to_end_time for o in delivered),
             'avg_food_wait_s':     safe_mean(o.food_wait_time  for o in delivered),
@@ -317,10 +371,7 @@ def generate_orders(sim: Simulation, rate_per_minute: float):
 
 
 def get_order_rate(sim: Simulation) -> float:
-    """Returns orders/min for Zona Tec based on Monterrey peak patterns.
-    
-    Calibrated from TomTom + DiDi Food/CANIRAC triangulation.
-    Zona Tec assumed ~15-25% of metro order volume given restaurant density.
+    """Returns orders/min based on Monterrey delivery demand patterns.
 
     Args:
         sim: Running Simulation instance.
@@ -329,12 +380,24 @@ def get_order_rate(sim: Simulation) -> float:
         float: Orders per minute for the current simulated hour.
     """
     hour = sim.wall_clock_hour
-    if 12.0 <= hour < 14.0:
+    if 0.0 <= hour < 6.0:
+        return 1.0    # near dead zone
+    elif 6.0 <= hour < 10.0:
+        return 4.0    # morning warmup
+    elif 10.0 <= hour < 11.0:
+        return 10.0   # pre-lunch ramp
+    elif 11.0 <= hour < 12.0:
+        return 18.0   # approaching peak
+    elif 12.0 <= hour < 14.0:
         return 25.0   # lunch peak
+    elif 14.0 <= hour < 17.0:
+        return 10.0   # afternoon lull
+    elif 17.0 <= hour < 19.0:
+        return 15.0   # dinner ramp
     elif 19.0 <= hour < 22.0:
         return 20.0   # dinner peak
-    else:
-        return 8.0    # off-peak
+    elif 22.0 <= hour < 24.0:
+        return 6.0    # wind down
 # ---------------------------------------------------------------------------
 # Dynamic courier speed
 # ---------------------------------------------------------------------------

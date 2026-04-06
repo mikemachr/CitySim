@@ -15,10 +15,6 @@ def distrito_tec():
 
     # Find the largest strongly connected component (where every node can reach every other node)
     largest_scc = max(nx.strongly_connected_components(sub_graph), key=len)
-
-    # Create a new graph containing only that component
-    sub_graph_connected = deepcopy(sub_graph.subgraph(largest_scc))
-
     # Define realistic average speeds for Monterrey urban driving (in km/h)
     hwy_speeds = {
         "residential": 20,
@@ -27,10 +23,12 @@ def distrito_tec():
         "primary": 45,
         "unclassified": 15
     }
-
     # Apply these conservative speeds
     sub_graph = ox.add_edge_speeds(sub_graph, hwy_speeds=hwy_speeds)
     sub_graph = ox.add_edge_travel_times(sub_graph)
+    # Create a new graph containing only that component
+    sub_graph_connected = deepcopy(sub_graph.subgraph(largest_scc))
+
 
 
     
@@ -81,7 +79,7 @@ def distrito_tec():
     residential_zones.reset_index(inplace=True)
     routable_restaurants.reset_index(inplace=True)
 
-    return sub_graph,routable_restaurants,residential_zones
+    return sub_graph_connected,routable_restaurants,residential_zones
 
 
 

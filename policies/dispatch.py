@@ -63,12 +63,15 @@ class HungarianPolicy(DispatchPolicy):
 
         cost_matrix = np.full((len(driver_ids), len(order_ids)), np.inf)
 
+        restaurant_nodes = [pending_orders[oid] for oid in order_ids]
+
         for i, driver_id in enumerate(driver_ids):
-            reachable = env.get_reachable(idle_driver_locations[driver_id], self.pickup_radius)
-            for j, order_id in enumerate(order_ids):
-                restaurant_node = pending_orders[order_id]
-                if restaurant_node in reachable:
-                    cost_matrix[i, j] = reachable[restaurant_node]
+            #reachable = env.get_reachable(idle_driver_locations[driver_id], self.pickup_radius)
+            # use cached 
+            reachable = env.get_reachable_cached(idle_driver_locations[driver_id], self.pickup_radius)
+            cost_matrix[i] = np.array([
+                reachable.get(node, np.inf) for node in restaurant_nodes
+            ])
 
         valid_rows = ~np.all(np.isinf(cost_matrix), axis=1)
         valid_cols = ~np.all(np.isinf(cost_matrix), axis=0)

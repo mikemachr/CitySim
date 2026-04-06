@@ -46,6 +46,8 @@ class Simulation:
         self._pending_set:   set[int]   = set()
         self.idle_drivers:   set[int]   = set()
 
+        self._active_user_ids: set[int] = set() # For guarding against same user placing more than one order at the time
+
     # ------------------------------------------------------------------
     # Entity registration
     # ------------------------------------------------------------------
@@ -87,6 +89,7 @@ class Simulation:
         self.pending_orders.append(order.id)
         self._pending_set.add(order.id)
         self.order_id_counter += 1
+        self._active_user_ids.add(user_id)
         return True
 
     # ------------------------------------------------------------------
@@ -129,6 +132,7 @@ class Simulation:
 
             elif event == DriverEvent.DROPOFF_COMPLETE:
                 order.delivered_time = self.current_time
+                self._active_user_ids.discard(order.user_id)
 
             elif event == DriverEvent.WENT_IDLE:
                 self.idle_drivers.add(driver.id)
@@ -152,7 +156,7 @@ class Simulation:
         for driver_id, order_id in assignments:
             order  = self.orders[order_id]
             driver = self.drivers[driver_id]
-
+            driver.speed = get_courier_speed_ms(self.wall_clock_hour)  # update speed dynamically 
             order.driver_id    = driver_id
             order.assigned_time = self.current_time
 
@@ -264,8 +268,14 @@ def generate_orders(sim: Simulation, rate_per_minute: float):
     Poisson arrivals. Restaurant choice via multinomial logit:
         utility = 1.0 * rating - 0.8 * (distance_km)
     """
-    ALPHA = 1.0
-    BETA  = 0.8
+    # Source: synthesized from Brazil delivery fee model (Frontiers 2022)
+    # and Ma et al. 2024 (Singapore mixed logit).
+    # β_rating range: +0.30 to +1.00 per star → use 0.6 midpoint
+    # β_distance range: −0.15 to −0.50 per km → use 0.3
+    # Ratio β_rating/β_distance implies indifference between
+    # +1 star and +2 km, which is reasonable for urban Monterrey.
+    ALPHA = 0.6   # per rating point (1–5 scale)
+    BETA  = 0.3   # per km of distance
 
     arrivals = np.random.poisson(rate_per_minute / 60 * sim.step_size)
     if arrivals == 0:
@@ -276,8 +286,12 @@ def generate_orders(sim: Simulation, rate_per_minute: float):
     for _ in range(arrivals):
         user_id = random.choice(user_ids)
         user    = sim.users[user_id]
-
-        reachable  = sim.env.get_reachable(user.location, cutoff_m=2500)
+        # Guard: skip if user already has an active order
+        if user_id in sim._active_user_ids:
+            continue
+        #reachable  = sim.env.get_reachable(user.location, cutoff_m=2500)
+        # Use cached version instead
+        reachable = sim.env.get_reachable_cached(user.location, cutoff_m=2500)
         candidates = [
             (rid, reachable[res.location])
             for rid, res in sim.restaurants.items()
@@ -297,16 +311,55 @@ def generate_orders(sim: Simulation, rate_per_minute: float):
         restaurant_id = candidates[np.random.choice(len(candidates), p=probs)][0]
         sim.process_user_request(user_id, restaurant_id)
 
+# ---------------------------------------------------------------------------
+# Dynamic order rate
+# ---------------------------------------------------------------------------
 
 
+def get_order_rate(sim: Simulation) -> float:
+    """Returns orders/min for Zona Tec based on Monterrey peak patterns.
+    
+    Calibrated from TomTom + DiDi Food/CANIRAC triangulation.
+    Zona Tec assumed ~15-25% of metro order volume given restaurant density.
 
-def get_order_rate(current_time_s: float) -> float:
-    """Returns orders/min as a function of simulated time."""
-    hour = (current_time_s / 3600) % 24
-    # lunch spike at 13h, dinner spike at 20h
-    if 12 <= hour < 14:
-        return 40
-    elif 19 <= hour < 22:
-        return 35
+    Args:
+        sim: Running Simulation instance.
+
+    Returns:
+        float: Orders per minute for the current simulated hour.
+    """
+    hour = sim.wall_clock_hour
+    if 12.0 <= hour < 14.0:
+        return 25.0   # lunch peak
+    elif 19.0 <= hour < 22.0:
+        return 20.0   # dinner peak
     else:
-        return 8
+        return 8.0    # off-peak
+# ---------------------------------------------------------------------------
+# Dynamic courier speed
+# ---------------------------------------------------------------------------
+    
+
+def get_courier_speed_ms(hour: float) -> float:
+    """Returns mean courier speed in m/s based on Monterrey TomTom data.
+    
+    Args:
+        hour: Current hour of day (0–24 float).
+    
+    Returns:
+        Mean speed in m/s, sampled from a normal with ~10% std.
+        Source: TomTom Traffic Index 2025, Monterrey.
+    """
+    if 12.0 <= hour < 14.0:       # lunch peak
+        mean_kmh = 31.0
+    elif 18.0 <= hour < 19.0:     # worst congestion
+        mean_kmh = 22.0
+    elif 19.0 <= hour < 21.0:     # dinner, easing
+        mean_kmh = 30.0
+    elif 22.0 <= hour or hour < 6.0:  # overnight
+        mean_kmh = 50.0
+    else:                          # general daytime
+        mean_kmh = 32.0
+    
+    mean_ms = mean_kmh / 3.6
+    return max(4.5, random.gauss(mean_ms, mean_ms * 0.10))

@@ -286,9 +286,33 @@ class Driver:
             self.coords = (point.y, point.x)  # (lat, lon)
 
     def _gen_pickup_service_time(self) -> float:
-        mu = np.log(75) - (0.45 ** 2) / 2
+        # Mean ~3.5 min. Source: Grubhub MDRP instances (Reyes et al. 2018)
+        mu = np.log(210) - (0.45 ** 2) / 2
         return random.lognormvariate(mu, 0.45)
 
     def _gen_dropoff_service_time(self) -> float:
-        mu = np.log(130) - (0.55 ** 2) / 2
-        return random.lognormvariate(mu, 0.55)
+        """Samples dropoff dwell time for a dense apartment context.
+
+        Uses a two-component Gaussian Mixture to reflect bimodal
+        delivery behavior observed in high-rise urban settings:
+        quick handoffs (customer waiting at door) vs. full building
+        access (intercom, elevator, unit search).
+
+        Zona Tec is predominantly mid-rise apartments, so the slow
+        component is weighted higher than in mixed residential areas.
+
+        Source: Zheng et al. 2022 (Complex & Intelligent Systems,
+        DOI: 10.1007/s40747-022-00719-4). Component means and weights
+        adjusted for Monterrey residential context.
+
+        Returns:
+            float: Dropoff service time in seconds.
+        """
+        # 30% quick handoff (~2 min), 70% full building access (~6 min)
+        if random.random() < 0.30:
+            mu = np.log(120) - (0.35 ** 2) / 2
+            return random.lognormvariate(mu, 0.35)
+        else:
+            mu = np.log(360) - (0.45 ** 2) / 2
+            return random.lognormvariate(mu, 0.45)
+

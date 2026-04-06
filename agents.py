@@ -1,145 +1,180 @@
 import random
 import networkx as nx
-from shapely.geometry import LineString
-from collections import deque
 import numpy as np
 from scipy.optimize import linear_sum_assignment
+from shapely.geometry import LineString
+from collections import deque
+
+
+# ---------------------------------------------------------------------------
+# Order
+# ---------------------------------------------------------------------------
+
 class Order:
-    """Links restaurants, users and drivers"""
-    def __init__(self, order_id, user_id, restaurant_id, prep_time, start_time,route_to_user):
+    """Links restaurants, users, and drivers. Tracks full timing for metrics."""
+
+    def __init__(self, order_id, user_id, restaurant_id, prep_time, start_time, route_to_user):
         self.id = order_id
         self.user_id = user_id
         self.restaurant_id = restaurant_id
-        self.driver_id: int|None = None
-        
-        # Timing attributes
+        self.driver_id: int | None = None
+
+        # Timing
         self.prep_time = prep_time
-        self.start_time = start_time
+        self.start_time = start_time          # tick order was placed
         self.ready_time = start_time + prep_time
-        
-        # Statuses: 'PREPARING', 'READY', 'PICKED_UP', 'DELIVERED'
+
+        # Filled in as events happen — used for metrics
+        self.assigned_time: float | None = None   # when a driver was assigned
+        self.pickup_time: float | None = None     # when driver finished pickup service
+        self.delivered_time: float | None = None  # when dropoff service ended
+
+        # Statuses: 'PREPARING' -> 'READY' -> 'PICKED_UP' -> 'DELIVERED'
         self.status = 'PREPARING'
-        self.route_to_user = route_to_user 
+        self.route_to_user = route_to_user
+
+    # ------------------------------------------------------------------
+    # Derived metrics (only valid after delivery)
+    # ------------------------------------------------------------------
+
+    @property
+    def end_to_end_time(self) -> float | None:
+        """Total time from order placed to delivered (seconds)."""
+        if self.delivered_time is None:
+            return None
+        return self.delivered_time - self.start_time
+
+    @property
+    def food_wait_time(self) -> float | None:
+        """Time food sat ready before a driver picked it up (seconds)."""
+        if self.pickup_time is None:
+            return None
+        ready = max(self.ready_time, self.assigned_time or self.ready_time)
+        return max(0.0, self.pickup_time - ready)
+
+    @property
+    def dispatch_delay(self) -> float | None:
+        """Time between order placed and driver assigned (seconds)."""
+        if self.assigned_time is None:
+            return None
+        return self.assigned_time - self.start_time
+
+
+# ---------------------------------------------------------------------------
+# Restaurant
+# ---------------------------------------------------------------------------
 
 class Restaurant:
-    """Fullfils orders"""
-    def __init__(self, restaurant_id: int, location: int, rating: float, 
-                 capacity: int, avg_prep_time: float,service_radius: float, 
+    """Fulfils orders. Has rating and capacity; generates lognormal prep times."""
+
+    def __init__(self, restaurant_id: int, location: int, rating: float,
+                 capacity: int, avg_prep_time: float, service_radius: float,
                  enabled=True):
         self.id = restaurant_id
-        self.location = location  # node id in graph
-        self.rating = rating 
+        self.location = location       # node id in graph
+        self.rating = rating           # 1.0 - 5.0, used in restaurant choice model
         self.capacity = capacity
-        self.avg_prep_time = avg_prep_time # seconds 
-        self.service_radius = service_radius # Maximum delivery distance in meters
-        self.active_orders = []  # Holds orders currently in preparation or ready
+        self.avg_prep_time = avg_prep_time   # seconds
+        self.service_radius = service_radius  # max delivery distance (meters)
+        self.active_orders: list[Order] = []
         self.enabled = enabled
 
-    def can_accept_order(self):
-        """Validates if the restaurant can take more orders based on capacity and status"""
+    def can_accept_order(self) -> bool:
         if not self.enabled:
             return False
         if len(self.active_orders) >= self.capacity:
             return False
-        # 1% random rejection probability to simulate real-world glitches
-        return random.random() > 0.01 
+        return random.random() > 0.01   # 1% random rejection
 
-    def update_preparing_orders_to_ready(self, current_time):
-        """Transitions orders from PREPARING to READY if prep time has elapsed"""
+    def generate_prep_time(self) -> float:
+        sigma = 0.5
+        mu = np.log(self.avg_prep_time) - (sigma ** 2) / 2
+        return random.lognormvariate(mu, sigma)
+
+    def update_preparing_orders_to_ready(self, current_time: float):
         for order in self.active_orders:
             if order.status == 'PREPARING' and current_time >= order.ready_time:
                 order.status = 'READY'
 
-    def generate_prep_time(self) -> float:
-        """Prep time sampled from lognormal distribution"""
-        mean = self.avg_prep_time
-
-        # Convert mean to lognormal parameters
-        sigma = 0.5
-        mu = np.log(mean) - (sigma**2)/2
-
-        return random.lognormvariate(mu, sigma)
-    
     def accept_order(self, order: Order):
-        """Adds a new order instance to the active queue"""
         self.active_orders.append(order)
         self._sync_enabled_status()
 
     def remove_order(self, order: Order):
-            """
-            Call this when a driver picks up the order.
-            This is the ONLY moment capacity is actually freed.
-            """
-            if order in self.active_orders:
-                self.active_orders.remove(order)
-                self._sync_enabled_status()
+        if order in self.active_orders:
+            self.active_orders.remove(order)
+            self._sync_enabled_status()
 
     def _sync_enabled_status(self):
-            """
-            Automatically toggles the restaurant status based on current capacity.
-            This acts as a safety 'circuit breaker'.
-            """
-            if len(self.active_orders) >= self.capacity:
-                self.enabled = False
-            else:
-                # You might want to keep it False if it was manually disabled, 
-                # but for this auto-scaling logic, we re-enable it when space opens up.
-                self.enabled = True
+        self.enabled = len(self.active_orders) < self.capacity
+
+
+# ---------------------------------------------------------------------------
+# User
+# ---------------------------------------------------------------------------
 
 class User:
-    def __init__(self,user_id :int,location: int):
+    def __init__(self, user_id: int, location: int):
         self.user_id = user_id
-        self.location = location
+        self.location = location  # node id in graph
+
+
+# ---------------------------------------------------------------------------
+# Driver
+# ---------------------------------------------------------------------------
 
 class Driver:
     """
-    Mobile agent that manages a queue of orders and moves continuously 
-    along the graph edges using distance-based interpolation.
+    Mobile agent. Moves along graph edges using distance-based interpolation.
+    Maintains a FIFO queue of orders.
     """
-    def __init__(self, driver_id: int, location_node: int, speed: float|None = None):
+
+    def __init__(self, driver_id: int, location_node: int, speed: float | None = None):
         self.id = driver_id
         self.location = location_node
         self.coords = (0.0, 0.0)
-        
+
         # Movement state
-        self.current_route = []
-        self.distance_on_edge = 0.0
-        self.current_edge = None
-        
+        self.current_route: list[int] = []
+        self.distance_on_edge: float = 0.0
+        self.current_edge: tuple | None = None
+
         # Logistics state
-        self.order_queue = deque() 
-        self.active_order:Order|None = None
-        self.status = 'IDLE' # 'IDLE', 'PICKING_UP', 'DELIVERING'
-        self.service_remaining = 0
-        self.service_type = None
-        # Effective driving speed (m/s)
-        # If not provided, sample from normal distribution
+        self.order_queue: deque[Order] = deque()
+        self.active_order: Order | None = None
+        self.status = 'IDLE'
+        self.service_remaining: float = 0.0
+        self.service_type: str | None = None
+
+        # Speed (m/s)
         if speed is None:
             sampled = random.gauss(6.9, 1.0)
             self.speed = max(4.5, sampled)
         else:
             self.speed = speed
 
-    def generate_pickup_service_time(self):
-        mean = 75
-        sigma = 0.45
-        mu = np.log(mean) - (sigma**2)/2
-        return random.lognormvariate(mu, sigma)
+    # ------------------------------------------------------------------
+    # Service time generators
+    # ------------------------------------------------------------------
 
-    def generate_dropoff_service_time(self):
-        mean = 130
-        sigma = 0.55
-        mu = np.log(mean) - (sigma**2)/2
-        return random.lognormvariate(mu, sigma)
+    def generate_pickup_service_time(self) -> float:
+        mu = np.log(75) - (0.45 ** 2) / 2
+        return random.lognormvariate(mu, 0.45)
 
-    def add_order(self, order, simulation):
-        """Adds an order to the FIFO queue and triggers movement if IDLE."""
+    def generate_dropoff_service_time(self) -> float:
+        mu = np.log(130) - (0.55 ** 2) / 2
+        return random.lognormvariate(mu, 0.55)
+
+    # ------------------------------------------------------------------
+    # Order management
+    # ------------------------------------------------------------------
+
+    def add_order(self, order: Order, simulation: 'Simulation'):
         self.order_queue.append(order)
         if self.status == 'IDLE':
             self._start_next_task(simulation)
 
-    def _start_next_task(self, simulation):
-
+    def _start_next_task(self, simulation: 'Simulation'):
         if not self.order_queue:
             self.status = 'IDLE'
             self.active_order = None
@@ -148,29 +183,17 @@ class Driver:
 
         self.active_order = self.order_queue[0]
 
-        # If order not picked up → go to restaurant
-        if self.active_order.status in ['PREPARING', 'READY']:
-
+        if self.active_order.status in ('PREPARING', 'READY'):
             self.status = 'PICKING_UP'
-
             res = simulation.restaurants[self.active_order.restaurant_id]
-
-            _, pickup_path = simulation.get_route_data(
-                self.location,
-                res.location
-            )
-
+            _, pickup_path = simulation.get_route_data(self.location, res.location)
             self.set_route(pickup_path)
 
-        # If order already picked up → deliver
         elif self.active_order.status == 'PICKED_UP':
-
             self.status = 'DELIVERING'
-
             self.set_route(self.active_order.route_to_user)
 
     def set_route(self, route_nodes):
-        """Initializes a route and prepares edge variables."""
         if not route_nodes or len(route_nodes) < 2:
             self.current_route = []
             self.current_edge = None
@@ -180,387 +203,414 @@ class Driver:
         self.distance_on_edge = 0.0
         self.location = route_nodes[0]
 
-    def update_position(self, step_size, simulation):
-        """
-        Movement engine with optimized route transition and safety checks.
-        """
+    # ------------------------------------------------------------------
+    # Movement engine
+    # ------------------------------------------------------------------
+
+    def update_position(self, step_size: float, simulation: 'Simulation'):
         # Handle service delays
-        if self.status in ['PICKUP_SERVICE', 'DROPOFF_SERVICE']:
+        if self.status in ('PICKUP_SERVICE', 'DROPOFF_SERVICE'):
             self.service_remaining -= step_size
-
             if self.service_remaining <= 0:
-
-                if self.service_type == "PICKUP":
-
+                if self.service_type == 'PICKUP':
                     res = simulation.restaurants[self.active_order.restaurant_id]
                     res.remove_order(self.active_order)
-
                     self.active_order.status = 'PICKED_UP'
-
-                    # start delivery route
-
+                    self.active_order.pickup_time = simulation.current_time
                     self._start_next_task(simulation)
-
-                elif self.service_type == "DROPOFF":
-
+                elif self.service_type == 'DROPOFF':
                     self.active_order.status = 'DELIVERED'
+                    self.active_order.delivered_time = simulation.current_time
                     self.order_queue.popleft()
                     self.status = 'IDLE'
                     self._start_next_task(simulation)
-
             return
-        # 1. Early exit if no route exists
+
         if not self.current_route or len(self.current_route) < 2:
             if self.status == 'PICKING_UP' and self.active_order and self.active_order.status == 'READY':
                 self._handle_arrival(simulation)
             return
 
-        # 2. Advance total distance for this tick
         self.distance_on_edge += self.speed * step_size
-        
-        # 3. Process node transitions
-        # We use a while loop to handle cases where step_size covers multiple edges
 
         while len(self.current_route) >= 2:
             u, v = self.current_edge
             edge_data = simulation.graph.get_edge_data(u, v)[0]
             edge_len = edge_data['length']
 
-            # If we haven't finished the current edge, stop transitioning
             if self.distance_on_edge < edge_len:
                 break
-            
-            # If we finished the edge, subtract its length and move to the next node
+
             self.distance_on_edge -= edge_len
             self.current_route.pop(0)
-            
-            # Check if we just reached the end of the entire route
+
             if len(self.current_route) < 2:
                 self.location = v
                 self._handle_arrival(simulation)
                 return
 
-            # Set up the next edge for the next iteration of the while loop
             self.current_edge = (self.current_route[0], self.current_route[1])
 
-        # 4. Update the visual coordinates based on final position in this tick
         self._update_coords(simulation.graph)
 
-    def _handle_arrival(self, simulation):
-        """State transition logic upon reaching a destination."""
+    def _handle_arrival(self, simulation: 'Simulation'):
         if self.status == 'PICKING_UP':
-
-            # Always start pickup service when arriving
             self.status = 'PICKUP_SERVICE'
             self.service_remaining = self.generate_pickup_service_time()
-            self.service_type = "PICKUP"
-
+            self.service_type = 'PICKUP'
         elif self.status == 'DELIVERING':
-
             self.status = 'DROPOFF_SERVICE'
             self.service_remaining = self.generate_dropoff_service_time()
-            self.service_type = "DROPOFF"
+            self.service_type = 'DROPOFF'
 
     def _update_coords(self, graph):
-            """Updates coordinates using normalized interpolation to bridge meters and degrees."""
-            if not self.current_edge:
-                return
-                
-            u, v = self.current_edge
-            edge_data = graph.get_edge_data(u, v)[0]
-            edge_len = edge_data['length'] # Meters
-            
-            line = edge_data.get('geometry', LineString([
-                (graph.nodes[u]['x'], graph.nodes[u]['y']), 
-                (graph.nodes[v]['x'], graph.nodes[v]['y'])
-            ]))
-            
-            # Calculate progress as a fraction (0.0 to 1.0)
-            # This prevents 'teleportation' by ignoring raw coordinate units
-            if edge_len > 0:
-                fraction = self.distance_on_edge / edge_len
-                # Use normalized=True to treat the line length as 1.0
-                point = line.interpolate(min(fraction, 1.0), normalized=True)
-                self.coords = (point.y, point.x) # (lat, lon)
+        if not self.current_edge:
+            return
+        u, v = self.current_edge
+        edge_data = graph.get_edge_data(u, v)[0]
+        edge_len = edge_data['length']
+        line = edge_data.get('geometry', LineString([
+            (graph.nodes[u]['x'], graph.nodes[u]['y']),
+            (graph.nodes[v]['x'], graph.nodes[v]['y']),
+        ]))
+        if edge_len > 0:
+            fraction = self.distance_on_edge / edge_len
+            point = line.interpolate(min(fraction, 1.0), normalized=True)
+            self.coords = (point.y, point.x)   # (lat, lon)
+
+
+# ---------------------------------------------------------------------------
+# Simulation
+# ---------------------------------------------------------------------------
 
 class Simulation:
-    def __init__(self,graph, step_size=1):
-        self.current_time = 0       # Total seconds elapsed
-        self.step_size = step_size  # Duration of each tick
-        self.restaurants: dict[int,Restaurant] = {} # Dictionary for O(1) restaurant lookup
-        self.users : dict[int,User] = {} # Dictionary for O(1) restaurant lookup
-        self.drivers: dict[int, Driver] = {} # Dict for O(1) lookup
-        self.orders: dict[int,Order] = {}            # Global order history for analytics
-        self.order_id_counter = 1
-        self.route_cache = {}
+    """
+    Discrete-time simulation of a food delivery platform.
+
+    Parameters
+    ----------
+    graph : networkx.MultiDiGraph
+        Road network.
+    step_size : float
+        Seconds per tick (default 1).
+    dispatch_mode : str
+        'greedy'    - FIFO, assigns on arrival, fires every tick.
+        'hungarian' - batch bipartite matching, fires every dispatch_interval seconds.
+    dispatch_interval : float
+        Seconds between batch dispatches (hungarian mode only).
+    pickup_radius : float
+        Max distance (meters) a driver is considered for an order.
+    """
+
+    DISPATCH_MODES = ('greedy', 'hungarian')
+
+    def __init__(self, graph, step_size: float = 1,
+                 dispatch_mode: str = 'hungarian',
+                 dispatch_interval: float = 15,
+                 pickup_radius: float = 3000):
+
+        if dispatch_mode not in self.DISPATCH_MODES:
+            raise ValueError(f"dispatch_mode must be one of {self.DISPATCH_MODES}")
+
         self.graph = graph
+        self.step_size = step_size
+        self.current_time: float = 0.0
+        self.dispatch_mode = dispatch_mode
+        self.dispatch_interval = dispatch_interval
+        self.pickup_radius = pickup_radius
+        self.last_dispatch_time: float = 0.0
+
+        self.restaurants: dict[int, Restaurant] = {}
+        self.users: dict[int, User] = {}
+        self.drivers: dict[int, Driver] = {}
+        self.orders: dict[int, Order] = {}
+        self.order_id_counter: int = 1
+
+        self.route_cache: dict[tuple, tuple] = {}
+
+        # pending_orders deque preserves arrival order for greedy dispatch.
+        # _pending_set gives O(1) membership checks for hungarian cleanup.
         self.pending_orders: deque[int] = deque()
+        self._pending_set: set[int] = set()
+
         self.idle_drivers: set[int] = set()
-        self.dispatch_interval = 15   # seconds between batch dispatches
-        self.last_dispatch_time = 0
-        self.pickup_radius = 3000  # meters
+
+    # ------------------------------------------------------------------
+    # Entity registration
+    # ------------------------------------------------------------------
 
     def add_restaurant(self, restaurant: Restaurant):
         self.restaurants[restaurant.id] = restaurant
 
-    def add_user(self,user: User):
+    def add_user(self, user: User):
         self.users[user.user_id] = user
 
     def add_driver(self, driver: Driver):
-            self.drivers[driver.id] = driver
-            self.idle_drivers.add(driver.id)
+        self.drivers[driver.id] = driver
+        self.idle_drivers.add(driver.id)
 
-    def get_route_data(self, origin_node, destination_node):
-        """
-        Retrieves routing data. If it's the first time these nodes are connected,
-        it calculates the path and caches it.
-        """
+    # ------------------------------------------------------------------
+    # Routing
+    # ------------------------------------------------------------------
+
+    def get_route_data(self, origin_node: int, destination_node: int):
+        """Returns (distance_m, path_nodes). Caches results."""
         if origin_node == destination_node:
-            return 0, [origin_node]
-            
-        # We use a tuple of nodes as the key. This allows different users 
-        # at the same intersection to share the same path data.
+            return 0.0, [origin_node]
+
         cache_key = (origin_node, destination_node)
-        
-        # Check if key is missing OR if the path (index 1) is missing
         if cache_key not in self.route_cache or self.route_cache[cache_key][1] is None:
             try:
-                distance = nx.shortest_path_length(self.graph, origin_node, destination_node, weight='length')
-                path_nodes = nx.shortest_path(self.graph, origin_node, destination_node, weight='length')
-                self.route_cache[cache_key] = (distance, path_nodes)
+                distance = nx.shortest_path_length(
+                    self.graph, origin_node, destination_node, weight='length')
+                path = nx.shortest_path(
+                    self.graph, origin_node, destination_node, weight='length')
+                self.route_cache[cache_key] = (distance, path)
             except (nx.NetworkXNoPath, nx.NodeNotFound):
                 return None, None
-                
+
         return self.route_cache[cache_key]
 
-    
+    # ------------------------------------------------------------------
+    # Order creation
+    # ------------------------------------------------------------------
+
     def process_user_request(self, user_id: int, restaurant_id: int) -> bool:
-        """
-        Finalizes an order. Assumes visibility/distance has already 
-        been verified by the 'Discovery' layer.
-        """
+        """Creates an order if the restaurant can accept it."""
         user = self.users.get(user_id)
         res = self.restaurants.get(restaurant_id)
         if not user or not res:
             return False
 
-        # If the restaurant has kitchen capacity, we fulfill the order
-        if res.can_accept_order():
-            # Get path data (from cache if possible) to attach to the order
-            distance, path = self.get_route_data(res.location,user.location)
-            
-            if distance is None:
-                return False # Safety check if nodes aren't connected
+        if not res.can_accept_order():
+            return False
 
-            p_time = res.generate_prep_time()
-            new_order = Order(
-                order_id=self.order_id_counter,
-                user_id=user_id,
-                restaurant_id=restaurant_id,
-                prep_time=p_time,
-                start_time=self.current_time,
-                route_to_user=path 
-            )
-            # Add order to simulation object 
-            self.orders[self.order_id_counter] =new_order
-            # Add order to restaurant 
-            res.accept_order(new_order)
-            self.pending_orders.append(new_order.id)
-            self.order_id_counter += 1
+        distance, path = self.get_route_data(res.location, user.location)
+        if distance is None:
+            return False
 
-            return True
-            
-        return False
+        new_order = Order(
+            order_id=self.order_id_counter,
+            user_id=user_id,
+            restaurant_id=restaurant_id,
+            prep_time=res.generate_prep_time(),
+            start_time=self.current_time,
+            route_to_user=path,
+        )
+        self.orders[self.order_id_counter] = new_order
+        res.accept_order(new_order)
 
-    def dispatch_logic(self):
+        self.pending_orders.append(new_order.id)
+        self._pending_set.add(new_order.id)
+
+        self.order_id_counter += 1
+        return True
+
+    # ------------------------------------------------------------------
+    # Dispatch strategies (private)
+    # ------------------------------------------------------------------
+
+    def _dispatch_greedy(self):
         """
-        Event-driven dispatcher.
-
-        Assigns orders to idle drivers without scanning the whole
-        system every tick. Dispatch happens only when either
-        a new order appears or a driver becomes available.
+        FIFO greedy: pairs the next pending order with any idle driver.
+        No optimisation — first come, first served on both sides.
         """
-
         while self.pending_orders and self.idle_drivers:
-
             order_id = self.pending_orders.popleft()
+            self._pending_set.discard(order_id)
             order = self.orders[order_id]
 
-            # Safety check (order might have been cancelled in future versions)
             if order.driver_id is not None:
                 continue
 
             driver_id = self.idle_drivers.pop()
-            driver = self.drivers[driver_id]
-
             order.driver_id = driver_id
-            driver.add_order(order, self)
+            order.assigned_time = self.current_time
+            self.drivers[driver_id].add_order(order, self)
 
-    def batch_dispatch(self):
+    def _dispatch_hungarian(self):
         """
-        Assign drivers to orders using batch bipartite matching (Hungarian algorithm).
-        Drivers are matched to restaurant pickup locations minimizing travel distance.
+        Batch bipartite matching via the Hungarian algorithm.
+        Minimises total driver-to-restaurant travel distance across all
+        idle-driver / unassigned-order pairs reachable within pickup_radius.
         """
-
-        import numpy as np
-        import networkx as nx
-        from scipy.optimize import linear_sum_assignment
-
-        # Collect idle drivers
-        driver_ids = [
-            d.id for d in self.drivers.values()
-            if d.status == "IDLE"
-        ]
-
-        # Orders eligible for pickup
+        driver_ids = [d.id for d in self.drivers.values() if d.status == 'IDLE']
         order_ids = [
-        o.id for o in self.orders.values()
-        if o.status in ["PREPARING", "READY"] and o.driver_id is None
+            o.id for o in self.orders.values()
+            if o.status in ('PREPARING', 'READY') and o.driver_id is None
         ]
-
 
         if not driver_ids or not order_ids:
             return
 
-        n_drivers = len(driver_ids)
-        n_orders = len(order_ids)
+        cost_matrix = np.full((len(driver_ids), len(order_ids)), np.inf)
 
-        # Initialize cost matrix
-        cost_matrix = np.full((n_drivers, n_orders), np.inf)
-
-        # Build cost matrix using spatial filtering
         for i, driver_id in enumerate(driver_ids):
-
             driver = self.drivers[driver_id]
-
-            # Dijkstra search from driver position
-            reachable_nodes = nx.single_source_dijkstra_path_length(
-                self.graph,
-                driver.location,
-                cutoff=self.pickup_radius,
-                weight="length"
+            reachable = nx.single_source_dijkstra_path_length(
+                self.graph, driver.location,
+                cutoff=self.pickup_radius, weight='length'
             )
-
             for j, order_id in enumerate(order_ids):
+                res_loc = self.restaurants[self.orders[order_id].restaurant_id].location
+                if res_loc in reachable:
+                    cost_matrix[i, j] = reachable[res_loc]
 
-                order = self.orders[order_id]
-                res = self.restaurants[order.restaurant_id]
+        valid_rows = ~np.all(np.isinf(cost_matrix), axis=1)
+        valid_cols = ~np.all(np.isinf(cost_matrix), axis=0)
+        filtered = cost_matrix[np.ix_(valid_rows, valid_cols)]
 
-                if res.location in reachable_nodes:
-                    cost_matrix[i, j] = reachable_nodes[res.location]
-
-        # --- Remove infeasible rows / columns ---
-
-        valid_driver_rows = ~np.all(np.isinf(cost_matrix), axis=1)
-        valid_order_cols = ~np.all(np.isinf(cost_matrix), axis=0)
-
-        filtered_matrix = cost_matrix[np.ix_(valid_driver_rows, valid_order_cols)]
-
-        if filtered_matrix.size == 0:
+        if filtered.size == 0:
             return
 
-        # Solve assignment
-        row_ind, col_ind = linear_sum_assignment(filtered_matrix)
+        row_ind, col_ind = linear_sum_assignment(filtered)
+        row_ind = np.where(valid_rows)[0][row_ind]
+        col_ind = np.where(valid_cols)[0][col_ind]
 
-        # Map back to original indices
-        driver_indices = np.where(valid_driver_rows)[0]
-        order_indices = np.where(valid_order_cols)[0]
-
-        row_ind = driver_indices[row_ind]
-        col_ind = order_indices[col_ind]
-
-        # Execute assignments
         for r, c in zip(row_ind, col_ind):
-
             driver_id = driver_ids[r]
             order_id = order_ids[c]
-
-            driver = self.drivers[driver_id]
             order = self.orders[order_id]
-
-            # ---- critical missing line ----
             order.driver_id = driver_id
+            order.assigned_time = self.current_time
 
-            # remove from pending queue if present
-            if order_id in self.pending_orders:
+            if order_id in self._pending_set:
+                self._pending_set.discard(order_id)
                 try:
                     self.pending_orders.remove(order_id)
                 except ValueError:
                     pass
 
-            driver.add_order(order, self)
+            self.drivers[driver_id].add_order(order, self)
+
+    # ------------------------------------------------------------------
+    # Main loop
+    # ------------------------------------------------------------------
 
     def run_tick(self):
-        """Advances the simulation by one time step"""
+        """Advances simulation by one step_size."""
         self.current_time += self.step_size
-        
-        # Update Restaurant states (cooking logic)
+
         for res in self.restaurants.values():
             res.update_preparing_orders_to_ready(self.current_time)
-        
-        # Update Driver states (movement and delivery logic)
+
         for driver in self.drivers.values():
             driver.update_position(self.step_size, self)
 
-        # Run batch dispatch periodically
-        if self.current_time - self.last_dispatch_time >= self.dispatch_interval:
-            self.batch_dispatch()
-            self.last_dispatch_time = self.current_time
-            
+        if self.dispatch_mode == 'greedy':
+            self._dispatch_greedy()
+        else:
+            if self.current_time - self.last_dispatch_time >= self.dispatch_interval:
+                self._dispatch_hungarian()
+                self.last_dispatch_time = self.current_time
 
-    def get_nearby_restaurants(self, user_id, max_dist=2500):
-        user = self.users.get(user_id)
-        if not user or not self.graph:
-            return []
-
-        # This finds distances from User -> All reachable nodes
-        reachable_nodes = nx.single_source_dijkstra_path_length(
-            self.graph, 
-            user.location, 
-            cutoff=max_dist, 
-            weight='length'
-        )
-
-        available_restaurants = []
-        for res_id, res in self.restaurants.items():
-            if res.location in reachable_nodes:
-                # DO NOT set the path to None in the route_cache here.
-                # If you do, the next call will return None instead of calculating the path.
-                available_restaurants.append(res_id)
-        
-        return available_restaurants
-
-    def run_until(self, end_time):
-        """Executes simulation ticks until reaching the specified end time"""
+    def run_until(self, end_time: float):
         while self.current_time < end_time:
             self.run_tick()
 
-    def get_orders_by_status(self,status: str|list):
-        """Returns IDs of orders currently in the requested state"""
-        if type(status)==str:
+    # ------------------------------------------------------------------
+    # Queries
+    # ------------------------------------------------------------------
+
+    def get_nearby_restaurants(self, user_id: int, max_dist: float = 2500) -> list[int]:
+        user = self.users.get(user_id)
+        if not user or not self.graph:
+            return []
+        reachable = nx.single_source_dijkstra_path_length(
+            self.graph, user.location, cutoff=max_dist, weight='length'
+        )
+        return [res_id for res_id, res in self.restaurants.items()
+                if res.location in reachable]
+
+    def get_orders_by_status(self, status: str | list) -> list[int]:
+        if isinstance(status, str):
             status = [status]
         return [o.id for o in self.orders.values() if o.status in status]
-    
-def generate_orders(sim, rate_per_minute):
-    """
-    Generate new orders using a Poisson arrival process.
-    """
 
-    lam = rate_per_minute / 60
-    expected = lam * sim.step_size
-    arrivals = np.random.poisson(expected)
+    # ------------------------------------------------------------------
+    # Metrics snapshot
+    # ------------------------------------------------------------------
+
+    def metrics_snapshot(self) -> dict:
+        """
+        Returns a dict of current KPIs.
+        Time-based averages are computed over all delivered orders.
+        """
+        delivered = [o for o in self.orders.values() if o.status == 'DELIVERED']
+
+        def safe_mean(vals):
+            v = [x for x in vals if x is not None]
+            return float(np.mean(v)) if v else None
+
+        n_by_status = {s: 0 for s in ('PREPARING', 'READY', 'PICKED_UP', 'DELIVERED')}
+        for o in self.orders.values():
+            n_by_status[o.status] = n_by_status.get(o.status, 0) + 1
+
+        return {
+            'time': self.current_time,
+            'dispatch_mode': self.dispatch_mode,
+            'total_orders': len(self.orders),
+            'orders_by_status': n_by_status,
+            'idle_drivers': len(self.idle_drivers),
+            'pending_unassigned': len(self._pending_set),
+            'avg_end_to_end_s': safe_mean(o.end_to_end_time for o in delivered),
+            'avg_food_wait_s': safe_mean(o.food_wait_time for o in delivered),
+            'avg_dispatch_delay_s': safe_mean(o.dispatch_delay for o in delivered),
+            'n_delivered': len(delivered),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Order generation (Poisson arrivals + softmax restaurant choice)
+# ---------------------------------------------------------------------------
+
+def generate_orders(sim: Simulation, rate_per_minute: float):
+    """
+    Generates new orders using a Poisson arrival process.
+
+    Restaurant choice uses a softmax over a utility score:
+        utility = alpha * rating - beta * (distance_m / 1000)
+
+    This is a multinomial logit (MNL) model — standard in discrete
+    choice / transportation OR literature.
+
+    Parameters
+    ----------
+    sim : Simulation
+    rate_per_minute : float
+        Expected orders per minute across all users (lambda for Poisson).
+    """
+    ALPHA = 1.0   # weight on rating (scale 1-5)
+    BETA = 0.8    # penalty per km of distance
+
+    arrivals = np.random.poisson(rate_per_minute / 60 * sim.step_size)
+    if arrivals == 0:
+        return
 
     user_ids = list(sim.users.keys())
 
     for _ in range(arrivals):
-
         user_id = random.choice(user_ids)
+        user = sim.users[user_id]
 
-        nearby = sim.get_nearby_restaurants(user_id)
-
-        if not nearby:
+        reachable = nx.single_source_dijkstra_path_length(
+            sim.graph, user.location, cutoff=2500, weight='length'
+        )
+        candidates = [
+            (res_id, reachable[res.location])
+            for res_id, res in sim.restaurants.items()
+            if res.location in reachable
+        ]
+        if not candidates:
             continue
 
-        restaurant_id = random.choice(nearby)
+        utils = np.array([
+            ALPHA * sim.restaurants[rid].rating - BETA * (dist / 1000)
+            for rid, dist in candidates
+        ])
+        utils -= utils.max()   # numerical stability before exp
+        probs = np.exp(utils)
+        probs /= probs.sum()
 
+        restaurant_id = candidates[np.random.choice(len(candidates), p=probs)][0]
         sim.process_user_request(user_id, restaurant_id)

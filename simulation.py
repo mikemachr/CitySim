@@ -381,23 +381,25 @@ def get_order_rate(sim: Simulation) -> float:
     """
     hour = sim.wall_clock_hour
     if 0.0 <= hour < 6.0:
-        return 1.0    # near dead zone
+        return 0.5    # near dead zone
     elif 6.0 <= hour < 10.0:
-        return 4.0    # morning warmup
+        return 1.5    # morning warmup
     elif 10.0 <= hour < 11.0:
-        return 10.0   # pre-lunch ramp
+        return 3.0    # pre-lunch ramp
     elif 11.0 <= hour < 12.0:
-        return 18.0   # approaching peak
+        return 4.5    # approaching peak
     elif 12.0 <= hour < 14.0:
-        return 25.0   # lunch peak
+        return 5.0    # lunch peak — single platform Zona Tec estimate
     elif 14.0 <= hour < 17.0:
-        return 10.0   # afternoon lull
+        return 2.5    # afternoon lull
     elif 17.0 <= hour < 19.0:
-        return 15.0   # dinner ramp
+        return 3.5    # dinner ramp
     elif 19.0 <= hour < 22.0:
-        return 20.0   # dinner peak
+        return 5.0    # dinner peak
     elif 22.0 <= hour < 24.0:
-        return 6.0    # wind down
+        return 1.5    # wind down
+    else:
+        return 0.5 # In theory should only happen if hour is exactly 24, edge case
 # ---------------------------------------------------------------------------
 # Dynamic courier speed
 # ---------------------------------------------------------------------------

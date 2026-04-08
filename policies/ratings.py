@@ -167,4 +167,10 @@ def _compute_rating(
 
 
 def _clip(value: float, lo: float, hi: float) -> float:
+    """Clip a value from a range to the given bounds.
+    Args:
+       value (float): The value to clip.
+       lo (float): The lower bound of the clipping
+       hi (float): The upper bound of the clipping
+    """
     return max(lo, min(hi, value))

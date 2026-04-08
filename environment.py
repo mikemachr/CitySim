@@ -34,8 +34,20 @@ class Environment:
         )
 
     def get_edge_data(self, u: int, v: int) -> dict:
-        """Returns data dict for edge (u, v), first parallel edge."""
-        return self.graph.get_edge_data(u, v)[0]
+        """
+        Returns data dict for the first parallel edge between u and v.
+        
+        Raises:
+            KeyError: If no edge exists between nodes u and v.
+        """
+        edges = self.graph.get_edge_data(u, v)
+        
+        try:
+            # iter(edges.values()) will fail if edges is None
+            # next() will fail if the dictionary is empty
+            return next(iter(edges.values()))
+        except (TypeError, StopIteration):
+            raise KeyError(f"No edge found between {u} and {v}")
 
     def get_node_coords(self, node: int) -> tuple[float, float]:
         """Returns (lon, lat) for a graph node."""

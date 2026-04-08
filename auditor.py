@@ -61,7 +61,10 @@ def detect_incoherent_schedules(df):
 
     return incoherences
 
-# Usage example with your data:
-df = pd.read_csv('results.csv')
-results = detect_incoherent_schedules(df)
-print(f"Found {len(results)} incoherent driver schedules.")
+
+
+if __name__ == '__main__':
+    # Usage example with your data:
+    df = pd.read_csv('results.csv')
+    results = detect_incoherent_schedules(df)
+    print(f"Found {len(results)} incoherent driver schedules.")

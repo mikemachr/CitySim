@@ -10,6 +10,8 @@ from policies.dispatch import HungarianPolicy
 from policies.repositioning import StaticPolicy
 from typing import Any
 
+from policies.ratings import maybe_rate_order
+
 class Simulation:
     """
     Thin orchestrator. Owns the clock and agent registries.
@@ -21,8 +23,8 @@ class Simulation:
     def __init__(
         self,
         env: Environment,
-        dispatch_policy: DispatchPolicy       = None,
-        repositioning_policy: RepositioningPolicy = None,
+        dispatch_policy: DispatchPolicy | None       = None,
+        repositioning_policy: RepositioningPolicy | None = None,
         step_size: float = 10,
         dispatch_interval: float = 15,       # seconds, for batch policies
         start_hour: float = 0.0 
@@ -84,6 +86,7 @@ class Simulation:
             start_time=self.current_time,
             route_to_user=path,
         )
+        order.prior_rating = res.rating  # snapshot at placement time
         self.orders[self.order_id_counter] = order
         res.accept_order(order)
         self.pending_orders.append(order.id)
@@ -182,6 +185,7 @@ class Simulation:
             elif event == DriverEvent.DROPOFF_COMPLETE:
                 order.delivered_time = self.current_time
                 self._active_user_ids.discard(order.user_id)
+                maybe_rate_order(self, order.id)  # call to see if rating gets triggered 
 
             elif event == DriverEvent.WENT_IDLE:
                 if driver.available:
@@ -263,12 +267,44 @@ class Simulation:
         return [o.id for o in self.orders.values() if o.status in status]
 
     # ------------------------------------------------------------------
+    # Ratings
+    # ------------------------------------------------------------------
+
+
+    def rate_order(self, order_id: int, rating: int) -> None:
+        """Submit a 1-5 star rating for a delivered order.
+ 
+        Updates the order for traceability and the restaurant's running
+        average in O(1).  Raises ValueError on invalid input.
+ 
+        Args:
+            order_id: ID of the order being rated.
+            rating:   Integer stars, must be in [1, 5].
+        """
+        if rating not in (1, 2, 3, 4, 5):
+            raise ValueError(f"rating must be 1-5, got {rating}")
+ 
+        order = self.orders.get(order_id)
+        if order is None:
+            raise ValueError(f"order {order_id} not found")
+        if order.status != "DELIVERED":
+            raise ValueError(
+                f"order {order_id} cannot be rated (status={order.status!r})"
+            )
+        if order.rating is not None:
+            raise ValueError(f"order {order_id} already rated ({order.rating})")
+ 
+        order.rating     = rating
+        order.rated_time = self.current_time
+        self.restaurants[order.restaurant_id].submit_rating(rating)
+
+    # ------------------------------------------------------------------
     # Metrics
     # ------------------------------------------------------------------
 
     def metrics_snapshot(self) -> dict:
         delivered = [o for o in self.orders.values() if o.status == 'DELIVERED']
-
+        n_rated = [order for order in self.orders.values() if order.rating is not None]
         def safe_mean(vals):
             v = [x for x in vals if x is not None]
             return float(np.mean(v)) if v else None
@@ -292,6 +328,7 @@ class Simulation:
             'avg_food_wait_s':     safe_mean(o.food_wait_time  for o in delivered),
             'avg_dispatch_delay_s': safe_mean(o.dispatch_delay  for o in delivered),
             'n_delivered':         len(delivered),
+            'n_ratings':           len(n_rated)
         }
 
     @property

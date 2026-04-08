@@ -2,7 +2,8 @@ import osmnx as ox
 import networkx as nx
 from copy import deepcopy
 import geopandas as gpd
-
+from typing import cast, Dict, Union, List
+from shapely.geometry import Polygon, MultiPolygon, Point
 def distrito_tec():
     # 1. Load the real graph (as you did in liltest.ipynb)
     # For testing speed, we can use the Distrito Tec bounding box from your notebook
@@ -17,11 +18,11 @@ def distrito_tec():
     largest_scc = max(nx.strongly_connected_components(sub_graph), key=len)
     # Define realistic average speeds for Monterrey urban driving (in km/h)
     hwy_speeds = {
-        "residential": 20,
-        "tertiary": 25,
-        "secondary": 35,
-        "primary": 45,
-        "unclassified": 15
+        "residential": 20.,
+        "tertiary": 25.,
+        "secondary": 35.,
+        "primary": 45.,
+        "unclassified": 15.
     }
     # Apply these conservative speeds
     sub_graph = ox.add_edge_speeds(sub_graph, hwy_speeds=hwy_speeds)
@@ -32,9 +33,10 @@ def distrito_tec():
 
 
     
+    multi_di_graph_view = cast(nx.MultiDiGraph, sub_graph_connected)
+    raw_hull = ox.graph_to_gdfs(multi_di_graph_view, nodes=True, edges=False).union_all().convex_hull
 
-    graph_area = ox.graph_to_gdfs(sub_graph_connected, nodes=True, edges=False).unary_union.convex_hull
-    tags = {
+    tags: Dict[str, Union[bool, str, List[str]]] = {
         "amenity": [
             "restaurant",
             "fast_food",
@@ -48,13 +50,13 @@ def distrito_tec():
             "confectionery"
         ]
     }
-
+    graph_area = cast(Polygon | MultiPolygon, raw_hull)
     restaurants = ox.features_from_polygon(graph_area, tags=tags)
 
     # 3. Filter: Only keep restaurants that are close to a valid road node
     def is_routable(geom):
         # Find the nearest node in the SCC
-        nearest_node = ox.nearest_nodes(sub_graph_connected, X=geom.centroid.x, Y=geom.centroid.y)
+        nearest_node = ox.nearest_nodes(multi_di_graph_view, X=geom.centroid.x, Y=geom.centroid.y)
         
         # Calculate distance between restaurant and that road node (in degrees, roughly)
         # If the nearest road is too far (e.g., > 100 meters), it's probably not reachable by car
@@ -79,7 +81,7 @@ def distrito_tec():
     residential_zones.reset_index(inplace=True)
     routable_restaurants.reset_index(inplace=True)
 
-    return sub_graph_connected,routable_restaurants,residential_zones
+    return multi_di_graph_view,routable_restaurants,residential_zones
 
 
 
@@ -96,7 +98,7 @@ def get_closest_place_node_id(place: gpd.GeoDataFrame, G: nx.MultiDiGraph) -> in
         raise KeyError("No matches")
         
     # Get the coordinates of the first match
-    point = centroids_in_degrees.iloc[0]
+    point = cast(Point,centroids_in_degrees.iloc[0])
     x, y = point.x, point.y
     
     return ox.nearest_nodes(G, X=x, Y=y)

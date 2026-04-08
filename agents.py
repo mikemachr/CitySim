@@ -43,8 +43,12 @@ class Order:
         self.pickup_time:    float | None = None
         self.delivered_time: float | None = None
 
-        self.status        = 'PREPARING'
+        self.status : str        = 'PREPARING'
         self.route_to_user = route_to_user
+        
+        self.prior_rating: float | None = None  # restaurant.rating snapshotted at order creation
+        self.rating:      int | None   = None  # discrete 1-5, set post-delivery
+        self.rated_time:  float | None = None  # sim time when rating was submitted
 
     @property
     def end_to_end_time(self) -> float | None:
@@ -84,6 +88,9 @@ class Restaurant:
         self.service_radius = service_radius
         self.active_orders: list[Order] = []
         self.enabled        = enabled
+        # Rating accumulators — O(1) incremental average
+        self._rating_sum:   float = 0.0
+        self._rating_count: int   = 0
 
     def can_accept_order(self) -> bool:
         if not self.enabled:
@@ -111,6 +118,12 @@ class Restaurant:
             self.active_orders.remove(order)
             self._sync_enabled_status()
 
+    def submit_rating(self, stars: int) -> None:
+        """Record a 1-5 star rating and recompute the running average."""
+        self._rating_sum   += stars
+        self._rating_count += 1
+        self.rating         = self._rating_sum / self._rating_count
+
     def _sync_enabled_status(self):
         self.enabled = len(self.active_orders) < self.capacity
 
@@ -120,6 +133,13 @@ class Restaurant:
 # ---------------------------------------------------------------------------
 
 class User:
+    """
+    Static agent. Generates orders to restaurants and gets served by drivers. 
+    
+    Fully decoupled from Simulaton:
+      - Interacts with restaurants by providing ratings.
+      - Bases choices of restaurants on other user's ratings 
+    """
     def __init__(self, user_id: int, location: int):
         self.user_id  = user_id
         self.location = location
@@ -146,7 +166,7 @@ class Driver:
 
         self.current_route:     list[int]   = []
         self.distance_on_edge:  float       = 0.0
-        self.current_edge:      tuple | None = None
+        self.current_edge:      tuple[int,int] | None = None
 
         self.order_queue:      deque[Order] = deque()
         self.active_order:     Order | None = None
@@ -193,6 +213,8 @@ class Driver:
             self.service_remaining -= step_size
             if self.service_remaining <= 0:
                 order = self.active_order          # capture before any clearing
+                if order is None: 
+                    raise ValueError("No active order")
                 if self.service_type == 'PICKUP':
                     order.status = 'PICKED_UP'
                     events.append((DriverEvent.PICKUP_COMPLETE, order))
@@ -218,6 +240,8 @@ class Driver:
         self.distance_on_edge += self.speed * step_size
 
         while len(self.current_route) >= 2:
+            if self.current_edge is None:
+                raise ValueError("Current edge is none")
             u, v     = self.current_edge
             edge_len = env.get_edge_data(u, v)['length']
 
@@ -248,7 +272,8 @@ class Driver:
 
     def _begin_delivery(self):
         self.status = 'DELIVERING'
-        self.set_route(self.active_order.route_to_user)
+        if self.active_order is not None:
+            self.set_route(self.active_order.route_to_user)
 
     def set_route(self, route_nodes: list[int]):
         if not route_nodes or len(route_nodes) < 2:

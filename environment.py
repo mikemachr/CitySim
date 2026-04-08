@@ -14,7 +14,16 @@ class Environment:
         self._reachable_cache: dict[tuple, dict[int, float]] = {} # Graph weights assumed static for cache assumption to hold
 
     def get_route(self, origin: int, destination: int) -> tuple:
-        """Returns (distance_m, path_nodes). Cached. Returns (None, None) if no path."""
+        """
+        Returns the shortest path and distance between two nodes.
+
+        Args:
+            origin (int): The node where the route starts.
+            destination (int): The node where the route ends.
+
+        Returns:
+            tuple: A tuple containing the distance and the path as a list of nodes. If no path exists, returns (None, None).
+        """
         if origin == destination:
             return 0.0, [origin]
         key = (origin, destination)
@@ -28,7 +37,16 @@ class Environment:
         return self._route_cache[key]
 
     def get_reachable(self, origin: int, cutoff_m: float) -> dict[int, float]:
-        """Returns {node: distance_m} for all nodes reachable within cutoff_m."""
+        """
+        Returns a dictionary mapping each reachable node to its distance from the origin.
+
+        Args:
+            origin (int): The node where the search starts.
+            cutoff_m (float): The maximum distance from the origin.
+
+        Returns:
+            dict[int, float]: A dictionary mapping each reachable node to its distance from the origin.
+        """
         return nx.single_source_dijkstra_path_length(
             self.graph, origin, cutoff=cutoff_m, weight='length'
         )

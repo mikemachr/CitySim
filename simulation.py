@@ -54,13 +54,31 @@ class Simulation:
     # Entity registration
     # ------------------------------------------------------------------
 
-    def add_restaurant(self, restaurant: Restaurant):
+    def add_restaurant(self, restaurant: Restaurant) -> None:
+        """
+        Registers a new restaurant in the simulation.
+
+        Args:
+            restaurant: The restaurant to be registered.
+        """
         self.restaurants[restaurant.id] = restaurant
 
-    def add_user(self, user: User):
+    def add_user(self, user: User) -> None:
+        """
+        Registers a new user in the simulation.
+
+        Args:
+            user: The user to be registered.
+        """
         self.users[user.user_id] = user
 
-    def add_driver(self, driver: Driver):
+    def add_driver(self, driver: Driver) -> None:
+        """
+        Registers a new driver in the simulation and marks them as idle.
+
+        Args:
+            driver: The driver to be registered.
+        """
         self.drivers[driver.id] = driver
         self.idle_drivers.add(driver.id)
 
@@ -69,6 +87,16 @@ class Simulation:
     # ------------------------------------------------------------------
 
     def process_user_request(self, user_id: int, restaurant_id: int) -> bool:
+        """
+        Processes a new order request from a user.
+
+        Args:
+            user_id: The ID of the user placing the order.
+            restaurant_id: The ID of the restaurant to be visited.
+
+        Returns:
+            True if the order was successfully created, False otherwise.
+        """
         user = self.users.get(user_id)
         res  = self.restaurants.get(restaurant_id)
         if not user or not res or not res.can_accept_order():
@@ -99,7 +127,10 @@ class Simulation:
     # Main loop
     # ------------------------------------------------------------------
 
-    def run_tick(self):
+    def run_tick(self) -> None:
+        """
+        Advances the simulation by one time step.
+        """
         self.current_time += self.step_size
         self._process_schedule() # scheduler update 
         # 1. Restaurants: advance cooking
@@ -119,7 +150,13 @@ class Simulation:
         # 4. Reposition newly idle drivers
         self._run_repositioning()
 
-    def run_until(self, end_time: float):
+    def run_until(self, end_time: float) -> None:
+        """
+        Runs the simulation until a specified end time.
+
+        Args:
+            end_time: The target end time of the simulation.
+        """
         while self.current_time < end_time:
             self.run_tick()
 
@@ -177,6 +214,13 @@ class Simulation:
     # ------------------------------------------------------------------
 
     def _handle_driver_events(self, driver: Driver, events: list[tuple]):
+        """
+        Handle any events that happened to the driver in this time step.
+
+        Args:
+            driver (Driver): The driver whose events were generated.
+            events (list[tuple]): A list of event tuples, where each tuple contains an `event` value and the related order.
+        """
         for event, order in events:
             if event == DriverEvent.PICKUP_COMPLETE:
                 order.pickup_time = self.current_time
@@ -197,6 +241,9 @@ class Simulation:
     # ------------------------------------------------------------------
 
     def _run_dispatch(self):
+        """
+        Advances the dispatch state and assigns orders to drivers as necessary.
+        """
         if not self._pending_set or not self.idle_drivers:
             return
 
@@ -231,6 +278,9 @@ class Simulation:
     # ------------------------------------------------------------------
 
     def _run_repositioning(self):
+        """
+        Advances the repositioning state and updates drivers' positions as necessary.
+        """
         if not self.idle_drivers:
             return
 
@@ -255,6 +305,16 @@ class Simulation:
     # ------------------------------------------------------------------
 
     def get_nearby_restaurants(self, user_id: int, max_dist: float = 2500) -> list[int]:
+        """
+        Retrieves a list of restaurant IDs that are within the specified maximum distance from the given user.
+
+        Args:
+            user_id (int): The ID of the user whose location is used for this query.
+            max_dist (float): The maximum allowed distance in meters between the user and the restaurants.
+
+        Returns:
+            list[int]: A list of restaurant IDs that are within the specified maximum distance from the given user.
+        """
         user = self.users.get(user_id)
         if not user:
             return []
@@ -262,6 +322,15 @@ class Simulation:
         return [rid for rid, res in self.restaurants.items() if res.location in reachable]
 
     def get_orders_by_status(self, status: str | list) -> list[int]:
+        """
+        Retrieves a list of order IDs that match the specified statuses.
+
+        Args:
+            status (str|list): A single status or a list of statuses to filter by.
+
+        Returns:
+            list[int]: A list of order IDs that have the specified statuses.
+        """
         if isinstance(status, str):
             status = [status]
         return [o.id for o in self.orders.values() if o.status in status]

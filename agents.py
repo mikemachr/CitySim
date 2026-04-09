@@ -79,11 +79,21 @@ class Order:
         return max(0.0, self.pickup_time - ready)
 
     @property
-    def dispatch_delay(self) -> float | None:
-        """Returns the delay between preparation and assignment to a driver."""
+    def time_to_assign(self) -> float | None:
+        """Seconds from order placement to driver assignment.
+        Includes prep time, so this is not a measure of dispatcher speed alone."""
         if self.assigned_time is None:
             return None
         return self.assigned_time - self.start_time
+
+    @property
+    def dispatch_delay(self) -> float | None:
+        """Seconds from food ready to driver assignment.
+        Negative means the driver was assigned before the food finished (good).
+        Positive means the food waited unassigned after being ready."""
+        if self.assigned_time is None:
+            return None
+        return self.assigned_time - self.ready_time
 
 
 # ---------------------------------------------------------------------------

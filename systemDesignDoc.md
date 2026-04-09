@@ -186,13 +186,35 @@ Ciclo de vida:
 PREPARING -> READY -> PICKED_UP -> DELIVERED
 ```
 
-Propiedades calculadas:
+### Propiedades calculadas
 
 ```python
 end_to_end_time  = delivered_time - start_time
 food_wait_time   = max(0, pickup_time - max(ready_time, assigned_time))
-dispatch_delay   = assigned_time - start_time
+time_to_assign   = assigned_time - start_time
+dispatch_delay   = assigned_time - ready_time
 ```
+
+`dispatch_delay` mide cuanto tiempo despues de que la comida estuvo lista se asigno un conductor.
+Es una senal del balance entre oferta y demanda:
+
+- Negativo: el conductor fue asignado antes de que la comida estuviera lista. El conductor
+  viajo al restaurante y espero en el mostrador. Este es el resultado optimo -- la comida
+  no tiene tiempo de espera ocioso despues de su preparacion.
+- Cercano a cero: el conductor llego aproximadamente cuando la comida estuvo lista.
+- Positivo: la comida termino y estuvo sin asignar, esperando a que un conductor estuviera
+  disponible. Indica escasez local de conductores en ese momento.
+
+A nivel de flota, la distribucion del signo refleja el balance oferta/demanda a lo largo
+de la ventana de simulacion. Un escenario con exceso de conductores mostrara una distribucion
+mayormente negativa. Un escenario balanceado estara centrado cerca de cero con ambas colas.
+Un escenario con escasez de conductores estara sesgado fuertemente hacia valores positivos,
+con valores grandes durante las horas pico.
+
+`time_to_assign` (= `assigned_time - start_time`) tambien esta disponible pero incluye
+el tiempo de preparacion en la medicion, lo que lo hace inadecuado como metrica de
+capacidad de respuesta del despachador. Es util unicamente como duracion bruta desde
+la creacion de la orden hasta su asignacion.
 
 ### Restaurant
 

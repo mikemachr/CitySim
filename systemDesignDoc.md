@@ -176,7 +176,7 @@ Atributos:
 ```md
 id, user_id, restaurant_id, driver_id
 prep_time, start_time, ready_time
-assigned_time, pickup_time, delivered_time
+assigned_time, driver_arrival_time, pickup_time, delivered_time
 status, route_to_user
 ```
 
@@ -187,6 +187,31 @@ PREPARING -> READY -> PICKED_UP -> DELIVERED
 ```
 
 ### Propiedades calculadas
+
+```python
+end_to_end_time  = delivered_time - start_time
+food_idle_time   = max(0, driver_arrival_time - ready_time)
+driver_wait_time = max(0, ready_time - driver_arrival_time)
+time_to_assign   = assigned_time - start_time
+dispatch_delay   = assigned_time - ready_time
+food_wait_time   = max(0, pickup_time - max(ready_time, assigned_time))
+```
+
+#### Interpretacion de cada metrica
+
+**`end_to_end_time`** -- experiencia total del cliente desde que coloca la orden hasta que la recibe. Incluye prep time, viaje del driver al restaurante, dwell de pickup, viaje al usuario y dwell de entrega. Es la metrica principal del sistema. Valida.
+
+**`food_idle_time`** -- segundos que la comida estuvo lista en el restaurante antes de que llegara el driver. Mide ineficiencia del lado de la oferta. Cercano a cero en escenarios oversupplied (el driver llega antes de que la comida este lista), alto en undersupplied. Valida.
+
+**`driver_wait_time`** -- segundos que el driver espero en el restaurante antes de que la comida estuviera lista. Mide subutilizacion del driver. Alto en oversupplied, cercano a cero en undersupplied. Junto con `food_idle_time` caracteriza completamente el encuentro restaurante-driver. Valida.
+
+**`dispatch_delay`** -- diferencia entre el momento de asignacion y el momento en que la comida estuvo lista (`assigned_time - ready_time`). Negativo significa que el driver fue asignado antes de que la comida terminara, lo cual es el resultado optimo. Positivo indica que la comida espero sin driver asignado, senalizando escasez local. Solo discrimina entre escenarios en el caso undersupplied; en balanced y oversupplied colapsa a un valor trivialmente negativo (aproximadamente `dispatch_interval - prep_time`) porque siempre hay drivers ociosos disponibles. Valida parcialmente.
+
+**`time_to_assign`** -- segundos desde que se coloca la orden hasta que se asigna un driver (`assigned_time - start_time`). Incluye el prep time en la medicion, por lo que no es una medida de responsividad del despachador. En escenarios con exceso de oferta colapsa al valor del dispatch interval (~10s). No es util como metrica operacional; se mantiene por trazabilidad.
+
+**`food_wait_time`** -- definida como `max(0, pickup_time - max(ready_time, assigned_time))`. Incluye el dwell time del driver en el restaurante (~3.5 min siempre presente), lo que impide distinguir entre espera real y tiempo de handoff normal. No es limpia como metrica operacional. Reemplazada funcionalmente por `food_idle_time` y `driver_wait_time`. Se mantiene por compatibilidad con el ledger existente.
+
+**`order_rating`** -- rating sintetico de 1-5 estrellas generado post-entrega con probabilidad `p_rate = 0.20`. Funcion de `end_to_end_time` y `prior_rating`. Util para analisis de fairness entre restaurantes y zonas, no como ground truth de calidad de servicio.
 
 ```python
 end_to_end_time  = delivered_time - start_time

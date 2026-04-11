@@ -57,6 +57,7 @@ class Order:
         self.prior_rating: float | None = None  # restaurant.rating snapshotted at order creation
         self.rating:      int | None   = None  # discrete 1-5, set post-delivery
         self.rated_time:  float | None = None  # sim time when rating was submitted
+        self.driver_arrival_time: float | None = None # sim time when driver arrived
 
     @property
     def end_to_end_time(self) -> float | None:
@@ -95,6 +96,21 @@ class Order:
             return None
         return self.assigned_time - self.ready_time
 
+    @property
+    def food_idle_time(self) -> float | None:
+        """Seconds the food waited at the restaurant before the driver arrived.
+        Positive means the food was ready and sitting. Zero means driver arrived first."""
+        if self.driver_arrival_time is None or self.ready_time is None:
+            return None
+        return max(0.0, self.driver_arrival_time - self.ready_time)
+
+    @property
+    def driver_wait_time(self) -> float | None:
+        """Seconds the driver waited at the restaurant for the food to be ready.
+        Positive means the driver arrived before the food. Zero means food was ready first."""
+        if self.driver_arrival_time is None or self.ready_time is None:
+            return None
+        return max(0.0, self.ready_time - self.driver_arrival_time)
 
 # ---------------------------------------------------------------------------
 # Restaurant
@@ -323,7 +339,17 @@ class Driver:
 
             if len(self.current_route) < 2:
                 self.location = v
-                self._handle_arrival(events)
+                if self.status == 'PICKING_UP' and (
+                    self.active_order is None or self.active_order.status != 'READY'
+                ):
+                    # Arrived at restaurant but food not ready yet.
+                    # Clear route to park here; the no-route polling branch
+                    # will call _handle_arrival each tick until READY.
+                    self.current_route = []
+                    self.current_edge  = None
+                else:
+                    # Arrived at restaurant, food is ready. 
+                    self._handle_arrival(events)
                 return events
 
             self.current_edge = (self.current_route[0], self.current_route[1])

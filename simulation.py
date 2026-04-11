@@ -235,6 +235,8 @@ class Simulation:
                 if driver.available:
                     self.idle_drivers.add(driver.id)
             # if not available, driver goes offline silently — queue already drained
+            elif event == DriverEvent.ARRIVED_AT_RESTAURANT:
+                order.driver_arrival_time = self.current_time
 
     # ------------------------------------------------------------------
     # Dispatch — fully delegated to policy
